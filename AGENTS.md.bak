@@ -1,0 +1,47 @@
+# Agent Workflow
+
+Use this guide every time you work in the project so our files stay safe and easy to recover.
+
+## 0. Quick Checklist (in order)
+1. **Back up**: copy the file you plan to edit to `filename.ext.bak` (if one exists, increment to `.bak2`, `.bak3`, etc.).
+2. **Edit safely**: prefer `apply_patch` so diffs stay reviewable; other tooling is fine, but double-check the result.
+3. **Verify**: run the relevant build or test command. Fix errors and critical warnings. Incidental warnings can wait, but if they accumulate schedule a warning-fix pass.
+4. **Report**: mention the verification command and outcome in your update.
+5. **Clean up**: only after verification succeeds, delete backups with `Remove-ItemSafely path\to\file.bak` so they land in the recycle bin.
+
+## 1. Back up before you edit
+- Before touching a file, create a sibling backup with the `.bak` suffix. Use `.bak2`, `.bak3`, etc. if another backup already exists.
+- After the change is verified (builds, behaviour validated), remove the backup via `Remove-ItemSafely` so the file goes to the recycle bin instead of being permanently deleted.
+
+## 2. Prefer safe editing tools
+- Use `apply_patch` for most text and code edits because it keeps diffs small and reviewable.
+- It is fine to use PowerShell, Python, or other scripts when they are the best fit (for example, wide renames); just validate the result because these paths are easier to misapply.
+
+## 3. If something goes wrong, stop and report
+- Corruption, regressions, or accidental destruction of in-progress work: stop immediately.
+- Explain what you were doing, what broke, and outline recovery options (restore the `.bak`, pull from the recycle bin, fall back to an older Git revision, etc.) and wait for direction.
+- Minor typos or obvious compile errors with intact structure do not require escalation; fix and continue.
+
+## 4. Validation
+- After edits, run the relevant build or test commands to confirm the change.
+- Only remove backups once you have verified the results (or after you have reverted when asked).
+
+## 5. Communication
+- Always mention the checks you ran (build, test, lint) in your update.
+- Capture any TODOs or follow-up tasks so the next session picks up smoothly.
+
+## Project-Specific Notes
+- Target language: Rust 1.88 (stable). Default validation commands are `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo test`.
+- Primary workspace location: `J:\Recall4GPT`. Keep exports and generated databases under a dedicated `data` subfolder when possible.
+- SQLite is the current storage engine; `sqlite3.exe` lives in the workspace for quick inspection.
+- When adding dependencies, update `Cargo.toml` via `cargo add` and document major tooling decisions in `chatgtp_export.md`.
+
+## Environment Notes
+- Sessions run on Windows 10 inside Windows Terminal, which launches PowerShell for every shell command.
+- Quoting rules:
+  * Wrap scripts or paths in double quotes; PowerShell treats single quotes as literal strings (no interpolation).
+  * Escape double quotes inside command strings with `` `" `` or build the string via concatenation.
+  * Use backticks (`` ` ``) to escape special characters, or prefer double-quoted strings and the `--%` stop-parsing token when passing raw arguments.
+- Paths use backslashes by default; if you copy or paste from POSIX examples, adjust them to `C:\style\paths`.
+- Executable lookup follows PowerShell rules, so call tools with explicit extensions when needed (for example, `python.exe`).
+- Soft deletes: the `Recycle` module from the PowerShell Gallery handles recycle-bin deletes. Use `Remove-ItemSafely path\to\file`. Avoid flags like `-Recurse`, `-Force`, or `-DeletePermanently` unless you intentionally want a permanent delete; those options fall back to the native (destructive) `Remove-Item`.
