@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use glob::glob;
@@ -209,6 +211,10 @@ fn build_exclude_globs(patterns: &[String]) -> Result<Option<GlobSet>> {
 }
 
 fn suggest_path(original: &Path) -> Option<PathBuf> {
+    if original.as_os_str().is_empty() {
+        return None;
+    }
+
     if original.is_absolute() {
         let base = original.parent()?.to_path_buf();
         let file = PathBuf::from(original.file_name()?);
@@ -218,25 +224,162 @@ fn suggest_path(original: &Path) -> Option<PathBuf> {
     suggest_path_from(&base, original)
 }
 
-fn suggest_path_from(base: &Path, relative: &Path) -> Option<PathBuf> {
+fn suggest_path_from(base: &Path, needle: &Path) -> Option<PathBuf> {
+    if needle.as_os_str().is_empty() {
+        return None;
+    }
+
+    let suffixes = collect_suffixes(needle);
+    if suffixes.is_empty() {
+        return None;
+    }
+    let file_names = collect_simple_names(&suffixes);
+
     let mut current = base.to_path_buf();
+    let mut checked = HashSet::new();
     const MAX_ASCENT: usize = 64;
     for _ in 0..MAX_ASCENT {
-        let candidate = current.join(relative);
-        if candidate.exists() {
-            return Some(candidate);
+        if let Some(hit) = try_direct_candidates(&current, &suffixes, &mut checked) {
+            return Some(hit);
         }
 
-        if let Some(file_name) = relative.file_name() {
-            let candidate_name = current.join(file_name);
-            if candidate_name.exists() {
-                return Some(candidate_name);
-            }
+        if let Some(hit) =
+            search_sibling_directories(&current, &suffixes, &file_names, &mut checked)
+        {
+            return Some(hit);
         }
 
         if !current.pop() {
             break;
         }
+    }
+
+    None
+}
+
+fn collect_suffixes(needle: &Path) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut suffixes = Vec::new();
+
+    push_suffix(&mut suffixes, &mut seen, needle);
+
+    let components: Vec<PathBuf> = needle
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(PathBuf::from(name)),
+            _ => None,
+        })
+        .collect();
+
+    if components.len() > 1 {
+        for idx in 1..components.len() {
+            let suffix = components[idx..]
+                .iter()
+                .fold(PathBuf::new(), |mut acc, part| {
+                    acc.push(part);
+                    acc
+                });
+            push_suffix(&mut suffixes, &mut seen, &suffix);
+        }
+    }
+
+    if let Some(file_name) = needle.file_name() {
+        push_suffix(&mut suffixes, &mut seen, PathBuf::from(file_name));
+    }
+
+    suffixes
+}
+
+fn collect_simple_names(suffixes: &[PathBuf]) -> Vec<OsString> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for suffix in suffixes {
+        if suffix.components().count() == 1 {
+            if let Some(name) = suffix.file_name() {
+                let os = name.to_os_string();
+                if seen.insert(os.clone()) {
+                    names.push(os);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn push_suffix(
+    list: &mut Vec<PathBuf>,
+    seen: &mut HashSet<OsString>,
+    candidate: impl Into<PathBuf>,
+) {
+    let candidate = candidate.into();
+    if candidate.as_os_str().is_empty() {
+        return;
+    }
+    if seen.insert(candidate.as_os_str().to_os_string()) {
+        list.push(candidate);
+    }
+}
+
+fn try_direct_candidates(
+    current: &Path,
+    suffixes: &[PathBuf],
+    checked: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    for suffix in suffixes {
+        let candidate = current.join(suffix);
+        if let Some(hit) = check_candidate(candidate, checked) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn search_sibling_directories(
+    current: &Path,
+    suffixes: &[PathBuf],
+    simple_names: &[OsString],
+    checked: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    const MAX_SIBLINGS: usize = 256;
+    let iter = match fs::read_dir(current) {
+        Ok(iter) => iter,
+        Err(_) => return None,
+    };
+
+    for (idx, entry) in iter.flatten().enumerate() {
+        if idx >= MAX_SIBLINGS {
+            break;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            for suffix in suffixes {
+                let candidate = path.join(suffix);
+                if let Some(hit) = check_candidate(candidate, checked) {
+                    return Some(hit);
+                }
+            }
+        } else if path.is_file() {
+            if let Some(name) = path.file_name() {
+                if simple_names.iter().any(|target| target == name) {
+                    if let Some(hit) = check_candidate(path.clone(), checked) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn check_candidate(candidate: PathBuf, checked: &mut HashSet<PathBuf>) -> Option<PathBuf> {
+    if !checked.insert(candidate.clone()) {
+        return None;
+    }
+
+    if candidate.exists() {
+        return Some(candidate);
     }
 
     None
@@ -307,6 +450,36 @@ mod tests {
         std::fs::write(&target, "data").expect("write target");
 
         let suggestion = super::suggest_path_from(&child, Path::new("docs/file.md"));
+        assert_eq!(suggestion.unwrap(), target);
+    }
+
+    #[test]
+    fn suggest_path_scans_sibling_directories_for_file_name() {
+        let temp = tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let nested = repo_root.join("safeedit").join("src");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let docs = repo_root.join("docs");
+        std::fs::create_dir_all(&docs).expect("docs dir");
+        let target = docs.join("plan.md");
+        std::fs::write(&target, "plan").expect("write target");
+
+        let suggestion = super::suggest_path_from(&nested, Path::new("plan.md"));
+        assert_eq!(suggestion.unwrap(), target);
+    }
+
+    #[test]
+    fn suggest_path_finds_nested_descendant_under_sibling() {
+        let temp = tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let nested = workspace.join("safeedit").join("src");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let docs = workspace.join("docs").join("guides");
+        std::fs::create_dir_all(&docs).expect("docs dir");
+        let target = docs.join("plan.md");
+        std::fs::write(&target, "plan").expect("write target");
+
+        let suggestion = super::suggest_path_from(&nested, Path::new("docs/guides/plan.md"));
         assert_eq!(suggestion.unwrap(), target);
     }
 }

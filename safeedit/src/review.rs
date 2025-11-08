@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use regex::{Captures, Regex};
 use std::fs;
+use std::io::{self, Write};
 
 use crate::encoding::{DecodedText, EncodingStrategy};
 use crate::files::FileEntry;
@@ -14,6 +15,7 @@ pub struct ReviewInput<'a> {
     pub lines: Option<&'a str>,
     pub around: Option<&'a str>,
     pub follow: bool,
+    pub step: bool,
     pub search: Option<&'a str>,
     pub regex: bool,
 }
@@ -23,6 +25,7 @@ pub struct ReviewOptions {
     slices: Vec<ReviewSlice>,
     matcher: Option<Regex>,
     follow: bool,
+    step: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,11 +68,16 @@ impl ReviewOptions {
             slices,
             matcher,
             follow: input.follow,
+            step: input.step,
         })
     }
 
     pub fn matcher(&self) -> Option<&Regex> {
         self.matcher.as_ref()
+    }
+
+    pub fn step_mode(&self) -> bool {
+        self.step
     }
 }
 
@@ -112,7 +120,11 @@ fn review_file(
         if decoded.had_errors { "yes" } else { "no" }
     );
 
-    render_content(&decoded, options)?;
+    if options.step_mode() {
+        run_step_mode(&decoded, options.matcher())?;
+    } else {
+        render_content(&decoded, options)?;
+    }
     Ok(())
 }
 
@@ -171,6 +183,247 @@ fn highlight_line(line: &str, matcher: Option<&Regex>) -> String {
     } else {
         line.to_string()
     }
+}
+
+fn run_step_mode(decoded: &DecodedText, matcher: Option<&Regex>) -> Result<()> {
+    let lines: Vec<&str> = decoded.text.lines().collect();
+    if lines.is_empty() {
+        println!("(file is empty)");
+        return Ok(());
+    }
+
+    println!(
+        "Entering step mode. Commands: [Enter]/j=next line, b/p/k=previous line, g/G=head/tail, n/N=next/prev match, /pattern=set search, m=mark, '=jump mark, q=quit, ?=help"
+    );
+
+    let mut index = 0usize;
+    let mut bookmark: Option<usize> = None;
+    let mut dynamic_search: Option<Regex> = None;
+
+    loop {
+        print_step_line(
+            &lines,
+            index,
+            active_search(dynamic_search.as_ref(), matcher),
+        );
+        print!("step> ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        let bytes = io::stdin()
+            .read_line(&mut input)
+            .context("reading step input")?;
+        if bytes == 0 {
+            println!("stdin closed; exiting step mode.");
+            break;
+        }
+
+        match parse_step_command(input.trim()) {
+            StepCommand::NextLine => {
+                if index + 1 < lines.len() {
+                    index += 1;
+                } else {
+                    println!("(end of file)");
+                }
+            }
+            StepCommand::PrevLine => {
+                if index > 0 {
+                    index -= 1;
+                } else {
+                    println!("(start of file)");
+                }
+            }
+            StepCommand::Head => index = 0,
+            StepCommand::Tail => index = lines.len().saturating_sub(1),
+            StepCommand::Jump(target) => {
+                if target < lines.len() {
+                    index = target;
+                } else {
+                    println!("line {} is out of range (1-{})", target + 1, lines.len());
+                }
+            }
+            StepCommand::Search(pattern) => {
+                if pattern.trim().is_empty() {
+                    dynamic_search = None;
+                    println!("cleared interactive search pattern.");
+                } else {
+                    match build_interactive_regex(pattern.trim()) {
+                        Ok(regex) => {
+                            dynamic_search = Some(regex);
+                            println!("search set; use 'n'/'N' to jump between matches.");
+                        }
+                        Err(err) => println!("invalid search pattern: {err}"),
+                    }
+                }
+            }
+            StepCommand::FindNext => {
+                if let Some(regex) = active_search(dynamic_search.as_ref(), matcher) {
+                    if let Some(hit) = find_next_match(&lines, index, regex) {
+                        index = hit;
+                    } else {
+                        println!("no later matches.");
+                    }
+                } else {
+                    println!("no search pattern set. Use --search or type /pattern.");
+                }
+            }
+            StepCommand::FindPrev => {
+                if let Some(regex) = active_search(dynamic_search.as_ref(), matcher) {
+                    if let Some(hit) = find_prev_match(&lines, index, regex) {
+                        index = hit;
+                    } else {
+                        println!("no earlier matches.");
+                    }
+                } else {
+                    println!("no search pattern set. Use --search or type /pattern.");
+                }
+            }
+            StepCommand::SetBookmark => {
+                bookmark = Some(index);
+                println!("bookmark set at line {}", index + 1);
+            }
+            StepCommand::JumpBookmark => {
+                if let Some(mark) = bookmark {
+                    index = mark;
+                } else {
+                    println!("no bookmark set. Type 'm' to set one.");
+                }
+            }
+            StepCommand::Help => print_step_help(),
+            StepCommand::Quit => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn active_search<'a>(dynamic: Option<&'a Regex>, fallback: Option<&'a Regex>) -> Option<&'a Regex> {
+    dynamic.or(fallback)
+}
+
+fn find_next_match(lines: &[&str], index: usize, regex: &Regex) -> Option<usize> {
+    let mut pos = index + 1;
+    while pos < lines.len() {
+        if regex.is_match(lines[pos]) {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn find_prev_match(lines: &[&str], index: usize, regex: &Regex) -> Option<usize> {
+    let mut pos = index;
+    while pos > 0 {
+        pos -= 1;
+        if regex.is_match(lines[pos]) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+fn print_step_line(lines: &[&str], index: usize, matcher: Option<&Regex>) {
+    if let Some(line) = lines.get(index) {
+        let rendered = highlight_line(line, matcher);
+        println!("{:>6} | {}", index + 1, rendered);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StepCommand {
+    NextLine,
+    PrevLine,
+    Head,
+    Tail,
+    Jump(usize),
+    Search(String),
+    FindNext,
+    FindPrev,
+    SetBookmark,
+    JumpBookmark,
+    Help,
+    Quit,
+}
+
+fn parse_step_command(input: &str) -> StepCommand {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return StepCommand::NextLine;
+    }
+    if let Some(stripped) = trimmed.strip_prefix('/') {
+        return StepCommand::Search(stripped.to_string());
+    }
+    match trimmed {
+        "n" => return StepCommand::FindNext,
+        "N" => return StepCommand::FindPrev,
+        "G" => return StepCommand::Tail,
+        "'" => return StepCommand::JumpBookmark,
+        _ => {}
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "j" | "next" => StepCommand::NextLine,
+        "k" | "p" | "b" | "prev" => StepCommand::PrevLine,
+        "g" | "h" | "head" => StepCommand::Head,
+        "t" | "tail" => StepCommand::Tail,
+        "q" | "quit" => StepCommand::Quit,
+        "?" | "help" => StepCommand::Help,
+        "m" | "mark" => StepCommand::SetBookmark,
+        "jumpmark" | "return" => StepCommand::JumpBookmark,
+        _ => {
+            if let Some(target) = parse_jump_target(trimmed) {
+                StepCommand::Jump(target)
+            } else {
+                StepCommand::Help
+            }
+        }
+    }
+}
+
+fn build_interactive_regex(pattern: &str) -> Result<Regex> {
+    if let Some(rest) = pattern.strip_prefix("re:") {
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            bail!("regex pattern cannot be empty");
+        }
+        return Regex::new(trimmed).map_err(|err| anyhow!("invalid regex: {err}"));
+    }
+
+    if pattern.is_empty() {
+        bail!("pattern cannot be empty");
+    }
+
+    Regex::new(&regex::escape(pattern))
+        .map_err(|err| anyhow!("unable to build search regex: {err}"))
+}
+
+fn parse_jump_target(raw: &str) -> Option<usize> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = if trimmed.starts_with('g') || trimmed.starts_with('G') {
+        trimmed[1..].trim_start()
+    } else {
+        trimmed
+    };
+
+    let token = candidate.split_whitespace().next().unwrap_or("");
+    if token.is_empty() {
+        return None;
+    }
+
+    token
+        .parse::<usize>()
+        .ok()
+        .and_then(|val| if val == 0 { None } else { Some(val - 1) })
+}
+
+fn print_step_help() {
+    println!(
+        "commands: [Enter]/j next line, b/p/k previous line, g/G head/tail, n/N next/prev match, /pattern set search, m bookmark, ' jump bookmark, number or g <n> jump, q quit"
+    );
 }
 
 fn to_indices(start_line: usize, end_line: usize, total_lines: usize) -> (usize, usize) {
@@ -263,5 +516,40 @@ mod tests {
             highlight_line("foo bar foo", Some(&regex)),
             ">>foo<< bar >>foo<<"
         );
+    }
+
+    #[test]
+    fn parse_step_command_numeric_jump() {
+        assert_eq!(parse_step_command("12"), StepCommand::Jump(11));
+    }
+
+    #[test]
+    fn parse_step_command_goto() {
+        assert_eq!(parse_step_command("g 2"), StepCommand::Jump(1));
+    }
+
+    #[test]
+    fn parse_step_command_invalid_defaults_to_help() {
+        assert_eq!(parse_step_command("zzz"), StepCommand::Help);
+    }
+
+    #[test]
+    fn parse_step_command_search() {
+        assert_eq!(
+            parse_step_command("/todo"),
+            StepCommand::Search("todo".into())
+        );
+    }
+
+    #[test]
+    fn parse_step_command_next_match() {
+        assert_eq!(parse_step_command("n"), StepCommand::FindNext);
+        assert_eq!(parse_step_command("N"), StepCommand::FindPrev);
+    }
+
+    #[test]
+    fn parse_step_command_bookmarks() {
+        assert_eq!(parse_step_command("m"), StepCommand::SetBookmark);
+        assert_eq!(parse_step_command("'"), StepCommand::JumpBookmark);
     }
 }

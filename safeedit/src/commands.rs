@@ -61,62 +61,150 @@ fn apply_replace(decoded: &DecodedText, options: &ReplaceOptions) -> Result<Opti
 }
 
 fn report_suggestions(text: &str, pattern: &str) {
-    let mut best: Option<(usize, usize, usize, &str)> = None;
-    for (line_idx, line) in text.lines().enumerate() {
-        let entry = if let Some(pos) = line.find(pattern) {
-            (0, line_idx, pos, line)
-        } else {
-            let score = mismatch_score(line, pattern);
-            (score, line_idx, 0, line)
-        };
-
-        best = match best {
-            Some(current) if entry.0 >= current.0 => Some(current),
-            Some(_) | None => Some(entry),
-        };
-
-        if entry.0 == 0 {
-            break;
-        }
+    const LIMIT: usize = 3;
+    let suggestions = collect_suggestions(text, pattern, LIMIT);
+    if suggestions.is_empty() {
+        println!("no similar text found for '{pattern}'");
+        return;
     }
 
-    if let Some((_, line_idx, col, line)) = best {
+    println!("no exact matches; closest candidates:");
+    for suggestion in suggestions {
         println!(
-            "no exact matches; closest match near line {} column {}:\n  {}",
-            line_idx + 1,
-            col + 1,
-            line.trim()
+            "  - line {} column {} (score {}): {}",
+            suggestion.line_idx + 1,
+            suggestion.column + 1,
+            suggestion.score,
+            suggestion.line.trim()
         );
-    } else {
-        println!("no similar text found for '{pattern}'");
+        println!("    snippet: {}", suggestion.snippet);
+        let (pattern_view, diff_line) = render_diff_hint(&suggestion.snippet, pattern);
+        println!("    pattern: {pattern_view}");
+        println!("             {diff_line}");
     }
 }
 
-fn mismatch_score(line: &str, pattern: &str) -> usize {
-    let snippet = if line.len() >= pattern.len() {
-        &line[..pattern.len()]
-    } else {
-        line
-    };
-    levenshtein(snippet, pattern)
+#[derive(Debug, Clone)]
+struct Suggestion {
+    score: usize,
+    line_idx: usize,
+    column: usize,
+    line: String,
+    snippet: String,
+}
+
+fn collect_suggestions(text: &str, pattern: &str, limit: usize) -> Vec<Suggestion> {
+    if pattern.is_empty() {
+        return vec![];
+    }
+
+    let mut suggestions = Vec::new();
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some((score, column, snippet)) = best_window(line, pattern) {
+            suggestions.push(Suggestion {
+                score,
+                line_idx,
+                column,
+                line: line.to_string(),
+                snippet,
+            });
+        }
+    }
+
+    suggestions.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then(a.line_idx.cmp(&b.line_idx))
+            .then(a.column.cmp(&b.column))
+    });
+    if suggestions.len() > limit {
+        suggestions.truncate(limit);
+    }
+    suggestions
+}
+
+fn best_window(line: &str, pattern: &str) -> Option<(usize, usize, String)> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let line_chars: Vec<char> = line.chars().collect();
+    let pat_len = std::cmp::max(pattern.chars().count(), 1);
+    let mut best: Option<(usize, usize, String)> = None;
+
+    for start in 0..line_chars.len() {
+        if start >= line_chars.len() {
+            break;
+        }
+
+        let lengths = [pat_len, pat_len.saturating_add(2)];
+        for &len in &lengths {
+            let end = (start + len).min(line_chars.len());
+            if end <= start {
+                continue;
+            }
+            let snippet: String = line_chars[start..end].iter().collect();
+            let score = levenshtein(&snippet, pattern);
+            let candidate = (score, start, snippet);
+
+            best = match best.take() {
+                None => Some(candidate),
+                Some(current)
+                    if score < current.0
+                        || (score == current.0
+                            && (start < current.1
+                                || (start == current.1
+                                    && candidate.2.len() < current.2.len()))) =>
+                {
+                    Some(candidate)
+                }
+                Some(current) => Some(current),
+            };
+        }
+    }
+
+    best
+}
+
+fn render_diff_hint(snippet: &str, pattern: &str) -> (String, String) {
+    let snippet_chars: Vec<char> = snippet.chars().collect();
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let width = snippet_chars.len().max(pattern_chars.len());
+    let mut diff_line = String::with_capacity(width);
+    for idx in 0..width {
+        let sc = snippet_chars.get(idx).copied().unwrap_or(' ');
+        let pc = pattern_chars.get(idx).copied().unwrap_or(' ');
+        diff_line.push(if sc == pc { ' ' } else { '^' });
+    }
+    (pattern.to_string(), diff_line)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
-    let mut costs = (0..=b.len()).collect::<Vec<_>>();
-    for (i, ca) in a.chars().enumerate() {
-        let mut last = i;
-        costs[0] = i + 1;
-        for (j, cb) in b.chars().enumerate() {
-            let new = if ca == cb {
-                last
-            } else {
-                1 + std::cmp::min(std::cmp::min(costs[j], costs[j + 1]), last)
-            };
-            last = costs[j + 1];
-            costs[j + 1] = new;
-        }
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    if a_chars.is_empty() {
+        return b_chars.len();
     }
-    costs[b.len()]
+    if b_chars.is_empty() {
+        return a_chars.len();
+    }
+
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0; b_chars.len() + 1];
+
+    for (i, &ca) in a_chars.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let substitution_cost = if ca == cb { 0 } else { 1 };
+            current[j + 1] = std::cmp::min(
+                std::cmp::min(current[j] + 1, previous[j + 1] + 1),
+                previous[j] + substitution_cost,
+            );
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b_chars.len()]
 }
 
 #[cfg(test)]
@@ -131,5 +219,38 @@ mod tests {
     #[test]
     fn levenshtein_single_change() {
         assert_eq!(levenshtein("foo", "foa"), 1);
+    }
+
+    #[test]
+    fn levenshtein_handles_unicode() {
+        assert_eq!(levenshtein("café", "cafe"), 1);
+        assert_eq!(levenshtein("naïve", "naive"), 1);
+    }
+
+    #[test]
+    fn collect_suggestions_orders_by_score() {
+        let text = "alpha beta\naplha bent\nsomething else";
+        let suggestions = collect_suggestions(text, "alpha beta", 2);
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].line_idx, 0);
+        assert_eq!(suggestions[0].score, 0);
+        assert_eq!(suggestions[1].line_idx, 1);
+        assert!(suggestions[1].score > 0);
+    }
+
+    #[test]
+    fn best_window_handles_multibyte_chars() {
+        let line = "café example";
+        let pattern = "cafe";
+        let result = best_window(line, pattern).expect("suggestion");
+        assert_eq!(result.1, 0);
+        assert!(result.0 <= 1);
+    }
+
+    #[test]
+    fn render_diff_marks_variances() {
+        let (pattern_line, diff) = render_diff_hint("alpha", "alpah");
+        assert_eq!(pattern_line, "alpah");
+        assert_eq!(diff.trim_end(), "   ^^");
     }
 }

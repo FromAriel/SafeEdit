@@ -32,10 +32,11 @@ Use this guide every time you work in a project so our files stay safe and easy 
 - Capture any TODOs or follow-up tasks so the next session picks up smoothly.
 
 ## Repository-Specific Notes
-- Replace this section with concrete details for the repo you are touching (language version, package managers, data folders, external services, etc.).
-- List the canonical validation commands for the stack so agents can copy/paste them.
-- Document any required tools (CLI utilities, database files, API keys) and where they live in the repository or environment.
-- Note any special backup/restore procedures if they differ from the default workflow.
+- Codebase is a Rust workspace rooted at `safeedit/` (Rust 2021 edition, stable toolchain). Documentation and planning artifacts live under `docs/`, while `.safeedit/` stores change logs and undo artifacts (ignored by Git).
+- Canonical verification commands (run inside `safeedit/`): `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo test`. Run all three before marking a task complete; note the results in your update.
+- The `safeedit` binary is our primary editing tool—prefer invoking `cargo run -- <subcommand>` instead of ad-hoc scripts so we keep approvals, logging, and undo files consistent.
+- Backups: every write path produces `.bak`, `.bak2`, etc. Keep them until verification/tests pass, then prune safely via `safeedit cleanup --root .` (preview first; use `--apply` only when ready).
+- Change tracking: `safeedit log --tail N` and `safeedit report --since <ts>` summarize the rolling JSONL log in `.safeedit/change_log.jsonl`; cite these when explaining edits to teammates.
 
 ## Environment Notes
 - Default sessions run on Windows 10 inside Windows Terminal, which launches PowerShell for every shell command. If your environment differs, add a short note here so future agents know which shell/os assumptions are safe.
