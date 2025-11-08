@@ -15,6 +15,7 @@ chardetng = "0.1"
 encoding_rs = "0.8"
 regex = "1.11"
 similar = "2.6"
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 tempfile = "3.10"

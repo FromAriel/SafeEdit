@@ -209,20 +209,25 @@ fn build_exclude_globs(patterns: &[String]) -> Result<Option<GlobSet>> {
 }
 
 fn suggest_path(original: &Path) -> Option<PathBuf> {
-    let mut current = if original.is_absolute() {
-        original.parent()?.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?
-    };
+    if original.is_absolute() {
+        let base = original.parent()?.to_path_buf();
+        let file = PathBuf::from(original.file_name()?);
+        return suggest_path_from(&base, &file);
+    }
+    let base = std::env::current_dir().ok()?;
+    suggest_path_from(&base, original)
+}
 
-    let max_levels = 10usize;
-    for _ in 0..max_levels {
-        let candidate = current.join(original);
+fn suggest_path_from(base: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut current = base.to_path_buf();
+    const MAX_ASCENT: usize = 64;
+    for _ in 0..MAX_ASCENT {
+        let candidate = current.join(relative);
         if candidate.exists() {
             return Some(candidate);
         }
 
-        if let Some(file_name) = original.file_name() {
+        if let Some(file_name) = relative.file_name() {
             let candidate_name = current.join(file_name);
             if candidate_name.exists() {
                 return Some(candidate_name);
@@ -281,23 +286,18 @@ mod tests {
 
     #[test]
     fn suggest_path_finds_parent_relative_match() {
-        let original_dir = std::env::current_dir().expect("current dir");
         let temp = tempdir().expect("temp dir");
         let child = temp.path().join("child");
         std::fs::create_dir(&child).expect("child dir");
         let target = temp.path().join("target.txt");
         std::fs::write(&target, "test").expect("write target");
 
-        std::env::set_current_dir(&child).expect("enter child");
-        let suggestion = suggest_path(Path::new("target.txt"));
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-
+        let suggestion = super::suggest_path_from(&child, Path::new("target.txt"));
         assert_eq!(suggestion.unwrap(), target);
     }
 
     #[test]
     fn suggest_path_handles_relative_dirs() {
-        let original_dir = std::env::current_dir().expect("current dir");
         let temp = tempdir().expect("temp dir");
         let child = temp.path().join("sub");
         std::fs::create_dir(&child).expect("child dir");
@@ -306,10 +306,7 @@ mod tests {
         let target = docs.join("file.md");
         std::fs::write(&target, "data").expect("write target");
 
-        std::env::set_current_dir(&child).expect("enter child");
-        let suggestion = suggest_path(Path::new("docs/file.md"));
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-
+        let suggestion = super::suggest_path_from(&child, Path::new("docs/file.md"));
         assert_eq!(suggestion.unwrap(), target);
     }
 }

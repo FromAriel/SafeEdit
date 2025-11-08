@@ -134,6 +134,8 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - Transform pipeline now powers `replace`: for each resolved file we decode once, apply literal/regex replacements with optional capture expansion, enforce `--count/--expect`, and render a Myers diff preview via the `similar` crate. All operations remain dry-run with per-file summaries until we add apply/confirm UX.
 - `replace` now supports interactive approvals: run with `--apply` to approve each diff (`y/n/a/q`), still defaulting to dry-run previews otherwise. Writes reuse the source encoding and warn about lossy conversions.
 - Missing-path ergonomics: when a requested file isn’t found, the tool now scans up from the current directory to suggest likely matches (e.g., “did you mean `J:\codextool\docs\...`?”) before bailing.
+- Zero-match diagnostics: literal/regex replacements that find no hits now report the nearest line/column (Levenshtein-based) so typos are surfaced with useful context.
+- Rolling change log: every replace run appends JSONL entries to `.safeedit/change_log.jsonl` capturing timestamp, command, path, line summary, and whether the change was applied/skipped/dry-run. The log retains the latest ~500 entries for lightweight code-review breadcrumbs.
 - Unit tests cover the new helpers (file dedupe/normalization, encoding detection, review parsing/highlighting).
 
 ### Upcoming polish (from dogfooding)

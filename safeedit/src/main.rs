@@ -9,11 +9,13 @@ mod commands;
 mod diff;
 mod encoding;
 mod files;
+mod logging;
 mod review;
 mod transform;
 use commands::{ReplaceOptions, run_replace};
 use encoding::EncodingStrategy;
 use files::FileEntry;
+use logging::record_change;
 use transform::TransformResult;
 
 fn main() -> Result<()> {
@@ -68,14 +70,19 @@ fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
     let mut apply_all = false;
     for entry in &entries {
         let Some(result) = run_replace(entry, &encoding, &replace_options)? else {
+            if cmd.common.apply {
+                let _ = record_change("replace", &entry.path, "no-op", "no matches");
+            }
             continue;
         };
 
+        let line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
         println!("--- preview: {} ---", entry.path.display());
         diff::print_diff(&result.decoded.text, &result.new_text, cmd.common.context)?;
 
         if !cmd.common.apply {
             println!("dry-run: rerun with --apply to write this change.");
+            let _ = record_change("replace", &entry.path, "dry-run", &line_summary);
             continue;
         }
 
@@ -86,13 +93,18 @@ fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
         };
 
         match decision {
-            ApprovalDecision::Apply => apply_transform(entry, &result)?,
+            ApprovalDecision::Apply => {
+                apply_transform(entry, &result)?;
+                let _ = record_change("replace", &entry.path, "applied", &line_summary);
+            }
             ApprovalDecision::ApplyAll => {
                 apply_all = true;
                 apply_transform(entry, &result)?;
+                let _ = record_change("replace", &entry.path, "applied", &line_summary);
             }
             ApprovalDecision::Skip => {
                 println!("skipped {}", entry.path.display());
+                let _ = record_change("replace", &entry.path, "skipped", &line_summary);
             }
             ApprovalDecision::Quit => {
                 println!("stopping after user request.");

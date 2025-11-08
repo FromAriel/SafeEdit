@@ -53,8 +53,83 @@ fn apply_replace(decoded: &DecodedText, options: &ReplaceOptions) -> Result<Opti
     }
 
     if matches == 0 {
+        report_suggestions(&decoded.text, &options.pattern);
         return Ok(None);
     }
 
     Ok(Some(replaced))
+}
+
+fn report_suggestions(text: &str, pattern: &str) {
+    let mut best: Option<(usize, usize, usize, &str)> = None;
+    for (line_idx, line) in text.lines().enumerate() {
+        let entry = if let Some(pos) = line.find(pattern) {
+            (0, line_idx, pos, line)
+        } else {
+            let score = mismatch_score(line, pattern);
+            (score, line_idx, 0, line)
+        };
+
+        best = match best {
+            Some(current) if entry.0 >= current.0 => Some(current),
+            Some(_) | None => Some(entry),
+        };
+
+        if entry.0 == 0 {
+            break;
+        }
+    }
+
+    if let Some((_, line_idx, col, line)) = best {
+        println!(
+            "no exact matches; closest match near line {} column {}:\n  {}",
+            line_idx + 1,
+            col + 1,
+            line.trim()
+        );
+    } else {
+        println!("no similar text found for '{pattern}'");
+    }
+}
+
+fn mismatch_score(line: &str, pattern: &str) -> usize {
+    let snippet = if line.len() >= pattern.len() {
+        &line[..pattern.len()]
+    } else {
+        line
+    };
+    levenshtein(snippet, pattern)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let mut costs = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.chars().enumerate() {
+        let mut last = i;
+        costs[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let new = if ca == cb {
+                last
+            } else {
+                1 + std::cmp::min(std::cmp::min(costs[j], costs[j + 1]), last)
+            };
+            last = costs[j + 1];
+            costs[j + 1] = new;
+        }
+    }
+    costs[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levenshtein_exact() {
+        assert_eq!(levenshtein("foo", "foo"), 0);
+    }
+
+    #[test]
+    fn levenshtein_single_change() {
+        assert_eq!(levenshtein("foo", "foa"), 1);
+    }
 }
