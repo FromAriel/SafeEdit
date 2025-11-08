@@ -2,11 +2,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use regex::{Captures, Regex};
 use std::fs;
 use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::diff::{DIFF_MAX_BYTES, DIFF_MAX_LINE_BYTES, DIFF_MAX_LINES};
 use crate::encoding::{DecodedText, EncodingStrategy};
 use crate::files::FileEntry;
 
 const DEFAULT_HEAD_LINES: usize = 40;
+const REVIEW_MAX_LINES: usize = DIFF_MAX_LINES;
+const REVIEW_MAX_BYTES: usize = DIFF_MAX_BYTES;
+const REVIEW_MAX_LINE_BYTES: usize = DIFF_MAX_LINE_BYTES;
+const REVIEW_LINE_TRUNCATION_SUFFIX: &str = "... (line truncated)";
 
 #[derive(Debug, Clone)]
 pub struct ReviewInput<'a> {
@@ -38,6 +46,10 @@ enum ReviewSlice {
 
 impl ReviewOptions {
     pub fn from_input(input: ReviewInput<'_>) -> Result<Self> {
+        if input.follow && input.step {
+            bail!("--follow cannot be combined with --step mode");
+        }
+
         let mut slices = Vec::new();
 
         if let Some(range) = input.lines {
@@ -87,7 +99,10 @@ pub fn run(
     options: &ReviewOptions,
 ) -> Result<()> {
     if options.follow {
-        println!("follow mode is not yet implemented; proceeding with static preview.");
+        if let Some(entry) = entries.first() {
+            follow_file(entry, encoding, options)?;
+        }
+        return Ok(());
     }
 
     for entry in entries {
@@ -128,6 +143,52 @@ fn review_file(
     Ok(())
 }
 
+fn follow_file(
+    entry: &FileEntry,
+    encoding: &EncodingStrategy,
+    options: &ReviewOptions,
+) -> Result<()> {
+    println!("=== {} (follow mode) ===", entry.path.display());
+
+    if entry.metadata.is_probably_binary {
+        println!("skipping (suspected binary file)");
+        return Ok(());
+    }
+
+    println!("Press Ctrl+C to stop following.");
+    let mut last_snapshot: Option<String> = None;
+
+    loop {
+        match fs::read(&entry.path) {
+            Ok(bytes) => {
+                let decoded = encoding.decode(&bytes);
+                let current = decoded.text.clone();
+                if last_snapshot.as_deref() == Some(current.as_str()) {
+                    // no change
+                } else {
+                    let timestamp = OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| "unknown time".into());
+                    println!("--- updated at {timestamp} ---");
+                    println!(
+                        "decoded as {} via {} (errors: {})",
+                        decoded.decision.encoding.name(),
+                        decoded.decision.source,
+                        if decoded.had_errors { "yes" } else { "no" }
+                    );
+                    render_content(&decoded, options)?;
+                    last_snapshot = Some(current);
+                }
+            }
+            Err(err) => {
+                println!("error reading {}: {err}", entry.path.display());
+            }
+        }
+
+        thread::sleep(Duration::from_millis(750));
+    }
+}
+
 fn render_content(decoded: &DecodedText, options: &ReviewOptions) -> Result<()> {
     let lines: Vec<&str> = decoded.text.lines().collect();
 
@@ -136,42 +197,61 @@ fn render_content(decoded: &DecodedText, options: &ReviewOptions) -> Result<()> 
         return Ok(());
     }
 
+    let mut limiter = ReviewLimiter::new();
     for slice in &options.slices {
+        if limiter.truncated() {
+            break;
+        }
         match slice {
             ReviewSlice::Head(count) => {
                 println!("-- head ({count} lines) --");
                 let end = (*count).min(lines.len());
-                print_lines(&lines, 0, end, options.matcher());
+                print_lines(&lines, 0, end, options.matcher(), &mut limiter);
             }
             ReviewSlice::Tail(count) => {
                 println!("-- tail ({count} lines) --");
                 let start = lines.len().saturating_sub(*count);
-                print_lines(&lines, start, lines.len(), options.matcher());
+                print_lines(&lines, start, lines.len(), options.matcher(), &mut limiter);
             }
             ReviewSlice::Range { start, end } => {
                 println!("-- lines {start} to {end} --");
                 let (start_idx, end_idx) = to_indices(*start, *end, lines.len());
-                print_lines(&lines, start_idx, end_idx, options.matcher());
+                print_lines(&lines, start_idx, end_idx, options.matcher(), &mut limiter);
             }
             ReviewSlice::Around { line, context } => {
                 println!("-- around line {line} ± {context} --");
                 let start_line = line.saturating_sub(*context);
                 let end_line = line + *context;
                 let (start_idx, end_idx) = to_indices(start_line, end_line, lines.len());
-                print_lines(&lines, start_idx, end_idx, options.matcher());
+                print_lines(&lines, start_idx, end_idx, options.matcher(), &mut limiter);
             }
         }
     }
 
+    limiter.print_warnings();
     Ok(())
 }
 
-fn print_lines(lines: &[&str], start_idx: usize, end_idx: usize, matcher: Option<&Regex>) {
+fn print_lines(
+    lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    matcher: Option<&Regex>,
+    limiter: &mut ReviewLimiter,
+) {
     let end_idx = end_idx.min(lines.len());
     for (offset, line) in lines[start_idx..end_idx].iter().enumerate() {
         let number = start_idx + offset + 1;
         let rendered = highlight_line(line, matcher);
-        println!("{number:>6} | {rendered}");
+        if limiter.truncated() {
+            break;
+        }
+        let content = format!("{number:>6} | {rendered}");
+        if let Some(output) = limiter.push_line(content) {
+            println!("{output}");
+        } else {
+            break;
+        }
     }
 }
 
@@ -182,6 +262,90 @@ fn highlight_line(line: &str, matcher: Option<&Regex>) -> String {
             .into_owned()
     } else {
         line.to_string()
+    }
+}
+
+fn truncate_line_to_limit(line: &mut String) -> bool {
+    if line.len() <= REVIEW_MAX_LINE_BYTES {
+        return false;
+    }
+    let suffix = REVIEW_LINE_TRUNCATION_SUFFIX;
+    let target_len = REVIEW_MAX_LINE_BYTES.saturating_sub(suffix.len());
+    if line.len() > target_len {
+        line.truncate(target_len);
+    }
+    line.push_str(suffix);
+    true
+}
+
+struct ReviewLimiter {
+    total_bytes: usize,
+    total_lines: usize,
+    truncated: bool,
+    reason: Option<ReviewTruncateReason>,
+    line_truncations: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ReviewTruncateReason {
+    LineCount,
+    ByteCount,
+}
+
+impl ReviewLimiter {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            total_lines: 0,
+            truncated: false,
+            reason: None,
+            line_truncations: 0,
+        }
+    }
+
+    fn push_line(&mut self, mut line: String) -> Option<String> {
+        if self.truncated {
+            return None;
+        }
+        if truncate_line_to_limit(&mut line) {
+            self.line_truncations += 1;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(line.len() + 1);
+        self.total_lines = self.total_lines.saturating_add(1);
+        if self.total_lines >= REVIEW_MAX_LINES {
+            self.truncated = true;
+            self.reason = Some(ReviewTruncateReason::LineCount);
+        } else if self.total_bytes >= REVIEW_MAX_BYTES {
+            self.truncated = true;
+            self.reason = Some(ReviewTruncateReason::ByteCount);
+        }
+        Some(line)
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn print_warnings(&self) {
+        if self.line_truncations == 0 && !self.truncated {
+            return;
+        }
+        if self.line_truncations > 0 {
+            println!(
+                "(truncated {} long line(s) to ~{REVIEW_MAX_LINE_BYTES} bytes each)",
+                self.line_truncations
+            );
+        }
+        if let Some(reason) = self.reason {
+            match reason {
+                ReviewTruncateReason::LineCount => println!(
+                    "(output truncated at ~{REVIEW_MAX_LINES} lines; narrow your selection or review smaller ranges)"
+                ),
+                ReviewTruncateReason::ByteCount => println!(
+                    "(output truncated after ~{REVIEW_MAX_BYTES} bytes; narrow your selection or limit context)"
+                ),
+            }
+        }
     }
 }
 
@@ -324,8 +488,14 @@ fn find_prev_match(lines: &[&str], index: usize, regex: &Regex) -> Option<usize>
 
 fn print_step_line(lines: &[&str], index: usize, matcher: Option<&Regex>) {
     if let Some(line) = lines.get(index) {
-        let rendered = highlight_line(line, matcher);
+        let mut rendered = highlight_line(line, matcher);
+        let truncated = truncate_line_to_limit(&mut rendered);
         println!("{:>6} | {}", index + 1, rendered);
+        if truncated {
+            println!(
+                "(line truncated to ~{REVIEW_MAX_LINE_BYTES} bytes; narrow your selection to view the full content)"
+            );
+        }
     }
 }
 

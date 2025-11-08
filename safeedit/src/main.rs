@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -24,7 +25,7 @@ mod normalize;
 mod patch;
 mod review;
 mod transform;
-use commands::{ReplaceOptions, run_replace};
+use commands::{BlockOptions, RenameOptions, ReplaceOptions, run_block, run_rename, run_replace};
 use encoding::{DecodedText, EncodingStrategy};
 use files::{FileEntry, FileMetadata};
 use logging::{LineSpan, LineSpanKind, record_change};
@@ -48,6 +49,15 @@ impl ColorChoice {
             ColorChoice::Auto => io::stdout().is_terminal(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PagerMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +85,7 @@ fn run(cli: Cli) -> Result<()> {
 
 fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
     let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
     let entries = resolve_entries(&cmd.common)?;
     let encoding = resolve_encoding_strategy(&cmd.common)?;
     let literal_mode = cmd.literal || !cmd.regex;
@@ -91,6 +102,7 @@ fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
         allow_captures: !literal_mode,
         count: cmd.count,
         expect: cmd.expect,
+        after_line: cmd.after_line,
     };
     if cmd.diff_only {
         println!("diff-only mode enabled: changes will not be written even with --apply.");
@@ -144,12 +156,7 @@ fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
         let line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
         let line_spans = diff::collect_line_spans(&result.decoded.text, &result.new_text);
         println!("--- preview: {} ---", entry.path.display());
-        diff::print_diff(
-            &result.decoded.text,
-            &result.new_text,
-            cmd.common.context,
-            colorize,
-        )?;
+        diff::display_diff(&result.decoded.text, &result.new_text, &diff_config)?;
 
         if !apply_mode {
             stats.dry_run += 1;
@@ -246,6 +253,7 @@ fn handle_replace(cmd: ReplaceCommand) -> Result<()> {
 
 fn handle_apply(cmd: ApplyCommand) -> Result<()> {
     let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
     let encoding = resolve_encoding_strategy(&cmd.common)?;
     let root_dir = resolve_patch_root(cmd.root.as_ref())?;
     let mut work_items = collect_patch_work(&cmd.patch_files, &root_dir)?;
@@ -304,14 +312,15 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                         work.patch.index
                     )
                 })?;
-                let patched = apply_patch(&decoded.text, &parsed_patch).map_err(|err| {
-                    anyhow!(
-                        "failed to apply patch {}#{} to {}: {err}",
-                        work.patch.source.display(),
-                        work.patch.index,
-                        path.display()
-                    )
-                })?;
+                let patched = apply_patch_preserving_newlines(&decoded.text, &parsed_patch)
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to apply patch {}#{} to {}: {err}",
+                            work.patch.source.display(),
+                            work.patch.index,
+                            path.display()
+                        )
+                    })?;
 
                 let entry = FileEntry {
                     path: path.clone(),
@@ -355,7 +364,7 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                     continue;
                 }
 
-                diff::print_diff(&decoded.text, &patched, cmd.common.context, colorize)?;
+                diff::display_diff(&decoded.text, &patched, &diff_config)?;
                 let result = TransformResult {
                     decoded,
                     new_text: patched,
@@ -464,14 +473,15 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                     )
                 })?;
                 let base_text = String::new();
-                let new_text = apply_patch(&base_text, &parsed_patch).map_err(|err| {
-                    anyhow!(
-                        "failed to apply patch {}#{} for new file {}: {err}",
-                        work.patch.source.display(),
-                        work.patch.index,
-                        path.display()
-                    )
-                })?;
+                let new_text =
+                    apply_patch_preserving_newlines(&base_text, &parsed_patch).map_err(|err| {
+                        anyhow!(
+                            "failed to apply patch {}#{} for new file {}: {err}",
+                            work.patch.source.display(),
+                            work.patch.index,
+                            path.display()
+                        )
+                    })?;
                 if new_text == base_text {
                     println!(
                         "patch {}#{} produced no content for {}; skipping",
@@ -493,7 +503,7 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                     );
                     continue;
                 }
-                diff::print_diff(&base_text, &new_text, cmd.common.context, colorize)?;
+                diff::display_diff(&base_text, &new_text, &diff_config)?;
                 let decision = if apply_mode {
                     if apply_all {
                         ApprovalDecision::Apply
@@ -595,14 +605,15 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                         work.patch.index
                     )
                 })?;
-                let new_text = apply_patch(&decoded.text, &parsed_patch).map_err(|err| {
-                    anyhow!(
-                        "failed to apply delete patch {}#{} to {}: {err}",
-                        work.patch.source.display(),
-                        work.patch.index,
-                        path.display()
-                    )
-                })?;
+                let new_text = apply_patch_preserving_newlines(&decoded.text, &parsed_patch)
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to apply delete patch {}#{} to {}: {err}",
+                            work.patch.source.display(),
+                            work.patch.index,
+                            path.display()
+                        )
+                    })?;
                 if !new_text.is_empty() {
                     bail!(
                         "delete patch {}#{} for {} did not result in empty content",
@@ -611,7 +622,7 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                         path.display()
                     );
                 }
-                diff::print_diff(&decoded.text, &new_text, cmd.common.context, colorize)?;
+                diff::display_diff(&decoded.text, &new_text, &diff_config)?;
                 let line_summary = diff::summarize_lines(&decoded.text, &new_text);
                 let line_spans = diff::collect_line_spans(&decoded.text, &new_text);
                 if !apply_mode {
@@ -718,18 +729,19 @@ fn handle_apply(cmd: ApplyCommand) -> Result<()> {
                         work.patch.index
                     )
                 })?;
-                let new_text = apply_patch(&decoded.text, &parsed_patch).map_err(|err| {
-                    anyhow!(
-                        "failed to apply rename patch {}#{} for {} -> {}: {err}",
-                        work.patch.source.display(),
-                        work.patch.index,
-                        old_path.display(),
-                        new_path.display()
-                    )
-                })?;
+                let new_text = apply_patch_preserving_newlines(&decoded.text, &parsed_patch)
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to apply rename patch {}#{} for {} -> {}: {err}",
+                            work.patch.source.display(),
+                            work.patch.index,
+                            old_path.display(),
+                            new_path.display()
+                        )
+                    })?;
                 let content_changed = new_text != decoded.text;
                 if content_changed {
-                    diff::print_diff(&decoded.text, &new_text, cmd.common.context, colorize)?;
+                    diff::display_diff(&decoded.text, &new_text, &diff_config)?;
                 } else {
                     println!("(rename only; no textual diff)");
                 }
@@ -975,6 +987,27 @@ fn resolve_replacement_text(cmd: &ReplaceCommand) -> Result<(String, &'static st
     bail!("replacement text required; use --with, --with-stdin, or --with-clipboard");
 }
 
+fn resolve_block_body(cmd: &BlockCommand) -> Result<(String, &'static str)> {
+    if !cmd.body.is_empty() {
+        let text = cmd.body.join("\n");
+        return Ok((text, "literal"));
+    }
+    if let Some(path) = &cmd.body_file {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading block body from {}", path.display()))?;
+        return Ok((text, "file"));
+    }
+    if cmd.with_stdin {
+        let text = read_replacement_from_stdin()?;
+        return Ok((text, "stdin"));
+    }
+    if cmd.with_clipboard {
+        let text = read_replacement_from_clipboard()?;
+        return Ok((text, "clipboard"));
+    }
+    bail!("block body required; use --body, --body-file, --with-stdin, or --with-clipboard");
+}
+
 fn read_replacement_from_stdin() -> Result<String> {
     let mut buf = String::new();
     io::stdin()
@@ -991,8 +1024,11 @@ fn read_replacement_from_clipboard() -> Result<String> {
 }
 
 fn handle_block(cmd: BlockCommand) -> Result<()> {
+    let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
     let entries = resolve_entries(&cmd.common)?;
     let encoding = resolve_encoding_strategy(&cmd.common)?;
+    let (body_text, body_source) = resolve_block_body(&cmd)?;
     print_command_summary(
         "block",
         &cmd.common,
@@ -1002,12 +1038,127 @@ fn handle_block(cmd: BlockCommand) -> Result<()> {
             format!("start_marker={}", cmd.start_marker),
             format!("end_marker={}", cmd.end_marker),
             format!("mode={:?}", cmd.mode),
+            format!("body_source={body_source}"),
+            format!("body_length={} chars", body_text.chars().count()),
         ],
     );
+    let options = BlockOptions {
+        start_marker: cmd.start_marker.clone(),
+        end_marker: cmd.end_marker.clone(),
+        mode: cmd.mode,
+        body: body_text,
+    };
+    let apply_mode = cmd.common.apply;
+    let mut apply_all = cmd.common.auto_apply && apply_mode;
+    let mut stats = CommandStats::default();
+    for entry in &entries {
+        let Some(result) = run_block(entry, &encoding, &options)? else {
+            stats.no_op += 1;
+            log_change(
+                &cmd.common,
+                "block",
+                &entry.path,
+                "no-op",
+                "no change",
+                &[],
+                Some(status_extra(false, false)),
+            );
+            continue;
+        };
+
+        let line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
+        let line_spans = diff::collect_line_spans(&result.decoded.text, &result.new_text);
+        println!("--- preview: {} ---", entry.path.display());
+        diff::display_diff(&result.decoded.text, &result.new_text, &diff_config)?;
+
+        if !apply_mode {
+            stats.dry_run += 1;
+            println!("dry-run: rerun with --apply to write this change.");
+            log_change(
+                &cmd.common,
+                "block",
+                &entry.path,
+                "dry-run",
+                &line_summary,
+                &line_spans,
+                Some(status_extra(false, true)),
+            );
+            continue;
+        }
+
+        let decision = if apply_all {
+            ApprovalDecision::Apply
+        } else {
+            prompt_approval(&entry.path)?
+        };
+
+        match decision {
+            ApprovalDecision::Apply => {
+                apply_transform(
+                    entry,
+                    &result,
+                    None,
+                    cmd.common.undo_log.as_deref(),
+                    cmd.common.no_backup,
+                )?;
+                stats.applied += 1;
+                log_change(
+                    &cmd.common,
+                    "block",
+                    &entry.path,
+                    "applied",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(true, false)),
+                );
+            }
+            ApprovalDecision::ApplyAll => {
+                apply_all = true;
+                apply_transform(
+                    entry,
+                    &result,
+                    None,
+                    cmd.common.undo_log.as_deref(),
+                    cmd.common.no_backup,
+                )?;
+                stats.applied += 1;
+                log_change(
+                    &cmd.common,
+                    "block",
+                    &entry.path,
+                    "applied",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(true, false)),
+                );
+            }
+            ApprovalDecision::Skip => {
+                println!("skipped {}", entry.path.display());
+                stats.skipped += 1;
+                log_change(
+                    &cmd.common,
+                    "block",
+                    &entry.path,
+                    "skipped",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(false, false)),
+                );
+            }
+            ApprovalDecision::Quit => {
+                println!("stopping after user request.");
+                stats.skipped += 1;
+                break;
+            }
+        }
+    }
+    stats.print("block");
     Ok(())
 }
 
 fn handle_rename(cmd: RenameCommand) -> Result<()> {
+    let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
     let entries = resolve_entries(&cmd.common)?;
     let encoding = resolve_encoding_strategy(&cmd.common)?;
     print_command_summary(
@@ -1022,6 +1173,116 @@ fn handle_rename(cmd: RenameCommand) -> Result<()> {
             format!("case_aware={}", cmd.case_aware),
         ],
     );
+    let options = RenameOptions {
+        from: cmd.from.clone(),
+        to: cmd.to.clone(),
+        word_boundary: cmd.word_boundary,
+        case_aware: cmd.case_aware,
+    };
+    let apply_mode = cmd.common.apply;
+    let mut apply_all = cmd.common.auto_apply && apply_mode;
+    let mut stats = CommandStats::default();
+    for entry in &entries {
+        let Some(result) = run_rename(entry, &encoding, &options)? else {
+            stats.no_op += 1;
+            log_change(
+                &cmd.common,
+                "rename",
+                &entry.path,
+                "no-op",
+                "no change",
+                &[],
+                Some(status_extra(false, false)),
+            );
+            continue;
+        };
+        let line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
+        let line_spans = diff::collect_line_spans(&result.decoded.text, &result.new_text);
+        println!("--- preview: {} ---", entry.path.display());
+        diff::display_diff(&result.decoded.text, &result.new_text, &diff_config)?;
+
+        if !apply_mode {
+            stats.dry_run += 1;
+            println!("dry-run: rerun with --apply to write this change.");
+            log_change(
+                &cmd.common,
+                "rename",
+                &entry.path,
+                "dry-run",
+                &line_summary,
+                &line_spans,
+                Some(status_extra(false, true)),
+            );
+            continue;
+        }
+
+        let decision = if apply_all {
+            ApprovalDecision::Apply
+        } else {
+            prompt_approval(&entry.path)?
+        };
+
+        match decision {
+            ApprovalDecision::Apply => {
+                apply_transform(
+                    entry,
+                    &result,
+                    None,
+                    cmd.common.undo_log.as_deref(),
+                    cmd.common.no_backup,
+                )?;
+                stats.applied += 1;
+                log_change(
+                    &cmd.common,
+                    "rename",
+                    &entry.path,
+                    "applied",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(true, false)),
+                );
+            }
+            ApprovalDecision::ApplyAll => {
+                apply_all = true;
+                apply_transform(
+                    entry,
+                    &result,
+                    None,
+                    cmd.common.undo_log.as_deref(),
+                    cmd.common.no_backup,
+                )?;
+                stats.applied += 1;
+                log_change(
+                    &cmd.common,
+                    "rename",
+                    &entry.path,
+                    "applied",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(true, false)),
+                );
+            }
+            ApprovalDecision::Skip => {
+                println!("skipped {}", entry.path.display());
+                stats.skipped += 1;
+                log_change(
+                    &cmd.common,
+                    "rename",
+                    &entry.path,
+                    "skipped",
+                    &line_summary,
+                    &line_spans,
+                    Some(status_extra(false, false)),
+                );
+            }
+            ApprovalDecision::Quit => {
+                println!("stopping after user request.");
+                stats.skipped += 1;
+                break;
+            }
+        }
+    }
+    stats.print("rename");
     Ok(())
 }
 
@@ -1038,6 +1299,9 @@ fn handle_review(cmd: ReviewCommand) -> Result<()> {
         search: cmd.search.as_deref(),
         regex: cmd.regex,
     })?;
+    if cmd.follow && entries.len() != 1 {
+        bail!("--follow requires exactly one resolved file");
+    }
     print_command_summary(
         "review",
         &cmd.common,
@@ -1060,6 +1324,7 @@ fn handle_review(cmd: ReviewCommand) -> Result<()> {
 
 fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
     let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
     let entries = resolve_entries(&cmd.common)?;
     let encoding = resolve_encoding_strategy(&cmd.common)?;
     let report_format = ReportFormat::from_str(&cmd.report_format)?;
@@ -1072,8 +1337,11 @@ fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
         None
     };
 
-    let any_scan =
-        cmd.scan_encoding || cmd.scan_zero_width || cmd.scan_control || cmd.scan_trailing_space;
+    let any_scan = cmd.scan_encoding
+        || cmd.scan_zero_width
+        || cmd.scan_control
+        || cmd.scan_trailing_space
+        || cmd.scan_final_newline;
     let detect_zero_width = if any_scan { cmd.scan_zero_width } else { true };
     let detect_control = if any_scan { cmd.scan_control } else { true };
     let detect_trailing_space = if any_scan {
@@ -1081,7 +1349,11 @@ fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
     } else {
         true
     };
-    let detect_final_newline = detect_trailing_space;
+    let detect_final_newline = if any_scan {
+        cmd.scan_final_newline
+    } else {
+        true
+    };
     let detect_encoding = if any_scan { cmd.scan_encoding } else { true };
 
     print_command_summary(
@@ -1117,6 +1389,21 @@ fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
     let mut apply_all = cmd.common.auto_apply;
     let mut stats = CommandStats::default();
     for entry in &entries {
+        if entry.metadata.is_probably_binary {
+            println!("skipping {} (suspected binary file)", entry.path.display());
+            stats.skipped += 1;
+            log_change(
+                &cmd.common,
+                "normalize",
+                &entry.path,
+                "skipped",
+                "suspected binary file",
+                &[],
+                Some(status_extra(false, !cmd.common.apply)),
+            );
+            continue;
+        }
+
         let bytes = std::fs::read(&entry.path)
             .with_context(|| format!("reading {}", entry.path.display()))?;
         let decoded = encoding.decode(&bytes);
@@ -1129,7 +1416,13 @@ fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
             report_format,
         )?;
 
-        let Some(new_text) = outcome.cleaned else {
+        let convert_requested = convert_encoding.is_some();
+        let convert_only = outcome.cleaned.is_none() && convert_requested;
+        let new_text = if let Some(text) = outcome.cleaned {
+            text
+        } else if convert_requested {
+            decoded.text.clone()
+        } else {
             stats.no_op += 1;
             if cmd.common.apply {
                 log_change(
@@ -1156,15 +1449,28 @@ fn handle_normalize(cmd: NormalizeCommand) -> Result<()> {
         };
 
         let result = TransformResult { decoded, new_text };
-        let line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
+        let mut line_summary = diff::summarize_lines(&result.decoded.text, &result.new_text);
         let line_spans = diff::collect_line_spans(&result.decoded.text, &result.new_text);
-        println!("--- preview: {} ---", entry.path.display());
-        diff::print_diff(
-            &result.decoded.text,
-            &result.new_text,
-            cmd.common.context,
-            colorize,
-        )?;
+        if convert_only && line_spans.is_empty() {
+            line_summary = format!(
+                "encoding conversion to {}",
+                convert_encoding
+                    .as_ref()
+                    .map(|(_, label)| label.as_str())
+                    .unwrap_or("requested encoding")
+            );
+            println!(
+                "(no textual diff) {} will be rewritten using {}",
+                entry.path.display(),
+                convert_encoding
+                    .as_ref()
+                    .map(|(_, l)| l.as_str())
+                    .unwrap_or("requested encoding")
+            );
+        } else {
+            println!("--- preview: {} ---", entry.path.display());
+            diff::display_diff(&result.decoded.text, &result.new_text, &diff_config)?;
+        }
 
         if !cmd.common.apply {
             stats.dry_run += 1;
@@ -1971,6 +2277,61 @@ fn sanitize_path(path: &Path) -> String {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEndingStyle {
+    Lf,
+    Crlf,
+    Cr,
+}
+
+fn detect_line_ending_style(text: &str) -> LineEndingStyle {
+    if text.contains("\r\n") {
+        LineEndingStyle::Crlf
+    } else if text.contains('\r') {
+        LineEndingStyle::Cr
+    } else {
+        LineEndingStyle::Lf
+    }
+}
+
+fn normalize_to_lf(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+                normalized.push('\n');
+            }
+            _ => normalized.push(ch),
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+fn restore_from_lf(text: String, style: LineEndingStyle) -> String {
+    match style {
+        LineEndingStyle::Lf => text,
+        LineEndingStyle::Crlf => text.replace('\n', "\r\n"),
+        LineEndingStyle::Cr => text.replace('\n', "\r"),
+    }
+}
+
+fn apply_patch_preserving_newlines<'a>(
+    text: &str,
+    parsed_patch: &DiffPatch<'a, str>,
+) -> std::result::Result<String, diffy::ApplyError> {
+    let style = detect_line_ending_style(text);
+    let normalized = normalize_to_lf(text);
+    let patched = apply_patch(normalized.as_ref(), parsed_patch)?;
+    Ok(restore_from_lf(patched, style))
+}
+
 #[derive(Default)]
 struct CommandStats {
     applied: usize,
@@ -2015,8 +2376,8 @@ fn merge_common(base: &CommonArgs, overrides: &batch::PlanCommon) -> CommonArgs 
     if let Some(context) = overrides.context {
         merged.context = context;
     }
-    if let Some(pager) = &overrides.pager {
-        merged.pager = Some(pager.clone());
+    if let Some(pager) = overrides.pager {
+        merged.pager = pager;
     }
     if let Some(color) = overrides.color {
         merged.color = color;
@@ -2077,6 +2438,7 @@ fn build_normalize_command(
         scan_zero_width: step.scan_zero_width.unwrap_or(false),
         scan_control: step.scan_control.unwrap_or(false),
         scan_trailing_space: step.scan_trailing_space.unwrap_or(false),
+        scan_final_newline: step.scan_final_newline.unwrap_or(false),
     })
 }
 
@@ -2118,8 +2480,8 @@ struct CommonArgs {
     no_backup: bool,
     #[arg(long, default_value_t = 3)]
     context: usize,
-    #[arg(long, value_name = "PAGER")]
-    pager: Option<String>,
+    #[arg(long = "pager", value_enum, default_value = "auto")]
+    pager: PagerMode,
     #[arg(long = "color", value_enum, default_value = "auto")]
     color: ColorChoice,
     #[arg(long, action = ArgAction::SetTrue)]
@@ -2132,6 +2494,21 @@ struct CommonArgs {
     undo_log: Option<PathBuf>,
     #[arg(value_name = "EXTRA", value_parser = value_parser!(String))]
     extra_args: Vec<String>,
+}
+
+impl CommonArgs {
+    fn diff_display_config(&self, colorize: bool) -> diff::DiffDisplayConfig {
+        diff::DiffDisplayConfig {
+            context: self.context,
+            colorize,
+            pager_mode: self.pager,
+            interactive: self.allow_interactive_pager(),
+        }
+    }
+
+    fn allow_interactive_pager(&self) -> bool {
+        io::stdin().is_terminal() && io::stdout().is_terminal() && !self.auto_apply && !self.json
+    }
 }
 
 #[derive(Debug, Args)]
@@ -2191,10 +2568,29 @@ struct BlockCommand {
     end_marker: String,
     #[arg(long, value_name = "MODE", default_value = "replace")]
     mode: BlockMode,
+    #[arg(
+        long = "body",
+        value_name = "TEXT",
+        action = ArgAction::Append,
+        conflicts_with_all = ["body_file", "with_stdin", "with_clipboard"],
+        required_unless_present_any = ["body_file", "with_stdin", "with_clipboard"]
+    )]
+    body: Vec<String>,
+    #[arg(
+        long = "body-file",
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath,
+        conflicts_with_all = ["body", "with_stdin", "with_clipboard"]
+    )]
+    body_file: Option<PathBuf>,
+    #[arg(long = "with-stdin", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_clipboard"])]
+    with_stdin: bool,
+    #[arg(long = "with-clipboard", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_stdin"])]
+    with_clipboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockMode {
+pub enum BlockMode {
     Insert,
     Replace,
 }
@@ -2271,6 +2667,8 @@ struct NormalizeCommand {
     scan_control: bool,
     #[arg(long = "scan-trailing-space", action = ArgAction::SetTrue)]
     scan_trailing_space: bool,
+    #[arg(long = "scan-final-newline", action = ArgAction::SetTrue)]
+    scan_final_newline: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2303,6 +2701,28 @@ struct ReportCommand {
     since: Option<String>,
     #[arg(long = "format", default_value = "table")]
     format: String,
+}
+
+#[cfg(test)]
+mod patch_line_ending_tests {
+    use super::{DiffPatch, apply_patch_preserving_newlines};
+
+    #[test]
+    fn apply_patch_respects_crlf_inputs() {
+        let original = "alpha\r\nbeta\r\n";
+        let patch_text = "\
+--- a/file.txt
++++ b/file.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++beta2
+";
+        let patch = DiffPatch::from_str(patch_text).expect("patch parses");
+        let patched =
+            apply_patch_preserving_newlines(original, &patch).expect("patch applies cleanly");
+        assert_eq!(patched, "alpha\r\nbeta2\r\n");
+    }
 }
 
 #[cfg(test)]

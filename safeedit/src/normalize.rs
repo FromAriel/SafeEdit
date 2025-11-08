@@ -39,20 +39,14 @@ pub fn normalize_text(text: &str, opts: &NormalizeOptions) -> NormalizeOutcome {
 
     for ch in text.chars() {
         if ch == '\n' {
-            if opts.detect_trailing_space || opts.trim_trailing_space {
-                let trailing = count_trailing_ws(&line_buffer);
-                if let Some(count) = trailing_spaces.as_mut() {
-                    *count += trailing;
-                }
-                if opts.trim_trailing_space && trailing > 0 {
-                    let trimmed_len = line_buffer.trim_end_matches([' ', '\t']).len();
-                    line_buffer.truncate(trimmed_len);
-                    changed = true;
-                }
-            }
-            cleaned.push_str(&line_buffer);
-            cleaned.push('\n');
-            line_buffer.clear();
+            flush_line(
+                &mut line_buffer,
+                &mut cleaned,
+                opts,
+                trailing_spaces.as_mut(),
+                &mut changed,
+                true,
+            );
             continue;
         }
 
@@ -79,20 +73,14 @@ pub fn normalize_text(text: &str, opts: &NormalizeOptions) -> NormalizeOutcome {
         line_buffer.push(ch);
     }
 
-    if !line_buffer.is_empty() || !text.is_empty() {
-        if opts.detect_trailing_space || opts.trim_trailing_space {
-            let trailing = count_trailing_ws(&line_buffer);
-            if let Some(count) = trailing_spaces.as_mut() {
-                *count += trailing;
-            }
-            if opts.trim_trailing_space && trailing > 0 {
-                let trimmed_len = line_buffer.trim_end_matches([' ', '\t']).len();
-                line_buffer.truncate(trimmed_len);
-                changed = true;
-            }
-        }
-        cleaned.push_str(&line_buffer);
-    }
+    flush_line(
+        &mut line_buffer,
+        &mut cleaned,
+        opts,
+        trailing_spaces.as_mut(),
+        &mut changed,
+        false,
+    );
 
     if opts.ensure_eol && !cleaned.ends_with('\n') {
         cleaned.push('\n');
@@ -124,7 +112,7 @@ fn is_zero_width_char(ch: char) -> bool {
 }
 
 fn is_control_char(ch: char) -> bool {
-    ch.is_control() && ch != '\n' && ch != '\t'
+    ch.is_control() && ch != '\n' && ch != '\t' && ch != '\r'
 }
 
 fn count_trailing_ws(line: &str) -> usize {
@@ -132,6 +120,45 @@ fn count_trailing_ws(line: &str) -> usize {
         .rev()
         .take_while(|c| *c == ' ' || *c == '\t')
         .count()
+}
+
+fn flush_line(
+    line_buffer: &mut String,
+    cleaned: &mut String,
+    opts: &NormalizeOptions,
+    trailing_spaces: Option<&mut usize>,
+    changed: &mut bool,
+    append_newline: bool,
+) {
+    let mut had_cr = false;
+    if line_buffer.ends_with('\r') {
+        line_buffer.pop();
+        had_cr = true;
+    }
+
+    if opts.detect_trailing_space || opts.trim_trailing_space {
+        let trailing = count_trailing_ws(line_buffer);
+        if let Some(count) = trailing_spaces {
+            *count += trailing;
+        }
+        if opts.trim_trailing_space && trailing > 0 {
+            let new_len = line_buffer.len().saturating_sub(trailing);
+            line_buffer.truncate(new_len);
+            *changed = true;
+        }
+    }
+
+    if had_cr {
+        line_buffer.push('\r');
+    }
+
+    if !line_buffer.is_empty() || append_newline {
+        cleaned.push_str(line_buffer);
+        if append_newline {
+            cleaned.push('\n');
+        }
+    }
+    line_buffer.clear();
 }
 
 #[cfg(test)]
@@ -163,5 +190,13 @@ mod tests {
     fn missing_final_newline_reported() {
         let report = normalize_text("no newline", &base_opts()).report;
         assert_eq!(report.missing_final_newline, Some(true));
+    }
+
+    #[test]
+    fn trim_trailing_space_handles_crlf() {
+        let mut opts = base_opts();
+        opts.trim_trailing_space = true;
+        let outcome = normalize_text("hello  \r\nworld\t \r\n", &opts);
+        assert_eq!(outcome.cleaned, Some("hello\r\nworld\r\n".to_string()));
     }
 }

@@ -1,0 +1,8 @@
+steps:
+  - command: replace
+    pattern: "foo"
+    replacement: "bar"
+    common:
+      targets:
+        - qa_sandbox/docs/readme.md
+  - command: unknown

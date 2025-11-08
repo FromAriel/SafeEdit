@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::ColorChoice;
+use crate::{ColorChoice, PagerMode};
 
 #[derive(Debug, Deserialize)]
 pub struct BatchPlan {
@@ -38,7 +38,7 @@ pub struct PlanCommon {
     pub auto_apply: Option<bool>,
     pub no_backup: Option<bool>,
     pub context: Option<usize>,
-    pub pager: Option<String>,
+    pub pager: Option<PagerMode>,
     #[serde(default)]
     pub color: Option<ColorChoice>,
     pub json: Option<bool>,
@@ -96,6 +96,8 @@ pub struct NormalizePlan {
     pub scan_control: Option<bool>,
     #[serde(default)]
     pub scan_trailing_space: Option<bool>,
+    #[serde(default)]
+    pub scan_final_newline: Option<bool>,
 }
 
 pub fn load_plan(path: &Path) -> Result<BatchPlan> {

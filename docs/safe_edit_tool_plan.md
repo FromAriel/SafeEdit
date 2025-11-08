@@ -27,16 +27,16 @@ Deliver a Windows-friendly Rust CLI that performs complex text/code edits while 
 | --- | --- | --- |
 | `replace` | Replace a literal or regex match with supplied text. | `--regex`, `--literal`, `--count=N`, `--after-line`, `--encoding`, `--preview-context`, `--diff-only`, `--with-stdin`, `--with-clipboard` |
 | `apply` | Replay unified `.patch`/`.diff` files (mods + file create/delete) through the preview + approval loop. | `--patch <file>` (repeatable), `--root <dir>`, plus global `--apply/--yes/--context/--color` |
-| `block` | Insert/replace multi-line blocks anchored by sentinels. | `--start-marker`, `--end-marker`, `--mode={insert,replace}` |
+| `block` | Insert/replace multi-line blocks anchored by sentinels. | `--start-marker`, `--end-marker`, `--mode={insert,replace}`, `--body (repeatable)/--body-file/--with-stdin/--with-clipboard` |
 | `rename` | Rename identifiers/constants across files (case-preserving). | `--word-boundary`, `--case-aware`, `--target/--glob` |
 | `review` | Inspect files safely via head/tail, arbitrary line ranges, or interactive stepping. | `--head N`, `--tail N`, `--lines 120-160`, `--search`, `--highlight` |
 | `normalize` | Detect and fix encoding/mojibake/zero-width issues in text files without destructive rewrites. | `--encoding auto`, `--strip-zero-width`, `--strip-control`, `--trim-trailing-space`, `--ensure-eol`, `--scan-{encoding,zero-width,control,trailing-space}`, `--report-format {table,json}`, `--convert-encoding <target>`, `--apply` |
-| `script` | Run a single-file transform via embedded WASM/Lua/Python sandbox (phase 2). | `--script-file`, `--arg` |
-| `batch` | Execute a YAML-defined sequence of commands with one consolidated review. | `--plan plan.yaml` |
+| `script` | Planned: run a single-file transform via embedded WASM/Lua/Python sandbox. | (planned) |
+| `batch` | Execute a YAML-defined sequence of `replace`/`normalize` steps with one consolidated review (other verbs planned). | `--plan plan.yaml` |
 | `report` | Summarize change log activity for CI/stand-ups. | `--since <RFC3339>`, `--format {table,json}` |
 | `cleanup` | Remove stale `.bak`, `.bakN` safety copies with preview + approval. | `--root <dir>`, `--apply`, `--yes`, `--include-hidden` |
 
-All commands accept `--dry-run` (default true), `--apply` (skip prompt for automation), `--undo-log <dir>`, `--no-backup`, and `--pager`.
+All commands accept `--dry-run` (default true), `--apply` (skip prompt for automation), `--undo-log <dir>`, `--no-backup`, and `--pager {auto,always,never}` (auto = inline until diffs exceed 200 lines, then switch to the built-in viewer).
 
 ### CLI Semantics
 - **Common flags**
@@ -46,16 +46,20 @@ All commands accept `--dry-run` (default true), `--apply` (skip prompt for autom
   - `--encoding <auto|utf-8|utf-16-le|...>` override when detection is insufficient.
 - `--match-limit <n>` guard for maximum replacements, `--expect <n>` for exact matches.
 - `--context <lines>` controls diff preview (default 3).
-- `--pager <less|more|none>` chooses preview transport.
+- `--pager {auto,always,never}` toggles the integrated diff viewer (auto switches to 200-line pages once a diff exceeds ~200 lines, but falls back to inline when stdin/stdout are not interactive).
 - `--color {auto,always,never}` forces ANSI highlighting for diffs (auto defaults to on when stdout is a TTY).
 - `--json` emits machine-readable diff metadata for automation.
+- `replace --after-line <line>` skips matches whose first character is on or before the specified 1-based line, so you can leave headers/boilerplate untouched without crafting additional regex guards.
+- `block` expects both markers to exist; `--mode replace` rewrites whatever sits between them, while `--mode insert` only fills the region if it was empty (otherwise it errors). Supply the replacement body via repeatable `--body` flags (each becomes its own line), `--body-file`, `--with-stdin`, or `--with-clipboard`. Newlines and indentation are inferred from the existing block so inserted text keeps the surrounding formatting.
+- `rename --word-boundary` restricts matches to full identifiers; `--case-aware` makes the match case-insensitive and auto-adjusts the replacement casing (ALLCAPS, lowercase, PascalCase) to match each occurrence.
 - **`review`**
   - Modes: `--head <n>` (default 40), `--tail <n>`, `--lines <start:end>`, `--around <line>:<context>`, `--follow` (stream file as it changes).
   - Search: `--search <pattern>` (literal) or `--regex` toggle; matches highlighted with ANSI colors.
   - Interactive stepping: `--step` starts a prompt-driven navigator that echoes absolute line numbers, supports `/pattern` literal or `re:` regex searches, `n/N` match hopping, numeric/`g <line>` jumps, and single-letter bookmarks so dysgraphia-friendly reviews stay fast.
+  - Follow mode: `--follow` requires exactly one target file and is incompatible with `--step`; it reuses the same head/tail/around slices but refreshes whenever the file contents change until you hit Ctrl+C.
   - Output remains read-only; still passes through encoding normalization for display.
 - **`normalize`**
-  - Detection toggles: `--scan-encoding`, `--scan-zero-width`, `--scan-control`, `--scan-trailing-space`.
+  - Detection toggles: `--scan-encoding`, `--scan-zero-width`, `--scan-control`, `--scan-trailing-space`, `--scan-final-newline`. Use none to keep all detectors enabled; specify any to opt into just the detectors you need.
   - Fix toggles (all off unless `--apply`): `--convert-encoding <target>`, `--strip-zero-width`, `--strip-control`, `--trim-trailing-space`, `--ensure-eol`.
   - `--report-format {table,json}` chooses summary style; default prints table with severity levels.
   - Running without `--apply` only reports issues; with `--apply`, tool still shows diff and asks for confirmation.
@@ -98,6 +102,8 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - **Backups:** Optional `.bak` or timestamped copies; default on for non-git repos, configurable via `~/.safeedit.toml`.
 - **Backup hygiene:** Once changes are verified, run `safeedit cleanup --root <dir>` (preview first, then `--apply`) so `.bak`/`.bakN` files do not accumulate indefinitely.
 - **Logging:** Append JSONL entries capturing command, arguments, files touched, diff hash, success/failure.
+- **Normalize guardrails:** Text-only by default: suspected binary files are skipped with a warning, and the `--scan-*` flags only enable the detectors you explicitly request (otherwise all detectors run).
+- **Diff viewer guardrails:** Once a diff exceeds ~200 lines (or when `--pager always`), previews run through the internal pager that shows 200-line pages, caps captured output at ~5 MB/5k lines, and truncates any single diff line beyond 64 KB with a reminder to rerun with `--pager never` + narrower targets for pathological files (e.g., 500 MB single-line JSON blobs).
 - **Review mode guarantees:** `review` never writes, always respects encoding detection, and supports piping output to other tools, ensuring inspection actions are side-effect free.
 - **Normalization guardrails:** `normalize` defaults to report mode, requires explicit confirmation before altering content, and records both detected issues and applied fixes in the audit log.
 
@@ -163,6 +169,7 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - Zero-match diagnostics: literal/regex replacements that find no hits now surface the top three fuzzy matches, including line/column numbers, snippets, and inline diff markers so typos are easy to spot and correct.
 - Rolling change log: every replace run appends JSONL entries to `.safeedit/change_log.jsonl` capturing timestamp, command, path, action, line summary, and the specific line spans impacted (distinguishing modified vs. added). The log retains the latest ~500 entries for lightweight code-review breadcrumbs.
 - `review --step` engages an interactive line navigator (Enter/`j`=next line, `b`/`p`/`k`=previous, `g`/`G` jump to head/tail, `/pattern` sets a literal/`re:` regex search, `n`/`N` hop between matches, `m` drops a bookmark, `'` jumps back, numeric or `g <line>` jumps work as shortcuts, `q` exits) so dysgraphia-friendly walkthroughs never require leaving the terminal or losing context.
+- Diff viewer automatically switches to an internal pager when diffs exceed ~200 lines, showing 200-line chunks with the same navigation keys as `review --step`, while guarding against runaway blobs with 5 MB/5k-line buffers and 64 KB-per-line caps.
 - Replace input ergonomics: `--diff-only` forces preview-only runs (even with `--apply`), while `--with-stdin` and `--with-clipboard` let us feed large replacements without wrestling with shell quoting.
 - Auto-approve summaries: replace/normalize now finish with a concise applied/skipped/dry-run/no-op report so unattended runs (e.g., `--yes`) still show what happened.
 - `safeedit report --since <ts>` condenses change-log entries into per-command/action summaries (table or JSON) so CI jobs or stand-ups can cite what happened without tailing raw logs.
@@ -171,10 +178,12 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - `safeedit log --tail N` prints the most recent change-log entries (timestamp, command, action, line summary, path) so reviewers can quickly audit what changed without opening the JSONL file.
 - `safeedit apply --patch` ingests unified `.patch`/`.diff` files per target file, previews via the existing diff UI, honors `--apply/--yes`, records undo patches/log entries, and now supports same-path modifications plus file adds/deletes/renames.
 - Normalize command now supports detection toggles (`--scan-*`), `--report-format json` for machine-readable health checks, and `--convert-encoding <label>` so apply runs can transcode and clean in one pass; table output remains the default for interactive use.
+- Block command enforces sentinel-anchored replacements: both markers must exist, `--mode insert` refuses to overwrite non-empty regions, bodies can flow from literals/files/stdin/clipboard, repeatable `--body` literals make quick multi-line edits easy, and Safeedit mirrors the original line endings/indentation so replacements stay aligned.
+- Rename command now rewrites identifiers across files with optional word-boundary enforcement and case-aware replacements that adapt the new text (lowercase, uppercase, capitalized) to match each occurrence.
 - Unit tests cover the new helpers (file dedupe/normalization, encoding detection, review parsing/highlighting).
 
 ### Upcoming polish
-- Diff UX polish: add side-by-side output, smarter pager integration (or an equivalent Windows-native scroller), and optional HTML/exported reports for sharing diffs. The built-in plan is to buffer diffs up to ~5 MB/≈5k lines, then hand them to an internal viewer that shows 200-line pages with `review`-style controls (Enter/`n` next chunk, `p` previous, `g <line>`, `h`/`t`, `q` quit). If a single line exceeds 64 KB or the diff crosses the cap, truncate with a warning (“diff truncated; rerun with `--pager never` + targeted `--lines`”) instead of streaming massive blobs (e.g., 500 MB `conversations.json` on one line). Smaller diffs (<200 lines) stay inline so quick edits remain frictionless.
+- Diff UX polish: the internal pager now buffers up to ~5 MB/5k lines, enforces a 64 KB-per-line cap, and paginates in 200-line chunks (Enter/`n`, `p`, `g <line>`, `h`/`t`, `q`). Next steps are side-by-side diff rendering, optional HTML/export outputs, and richer color themes for large refactors.
 - Review ergonomics: extend `--step` with multi-bookmarks, search result listings, and copy-to-clipboard/export commands so longer reviews remain fast even when scanning thousands of lines.
 
 ## Outstanding Feature Checklist
@@ -187,7 +196,7 @@ The `review` command shares the preview loop but never writes; it simply paginat
 | Batch/recipes | YAML/JSON batch runner with consolidated approval | Done | `safeedit batch --plan` replays replace/normalize steps with shared previews + approvals. |
 | Undo assets | `.undo.patch` emission + auto-approve summary | Done | `--undo-log` drops per-file patches and each command prints applied/skipped/dry-run/no-op counts. |
 | Reporting | `safeedit report --since <ts>` | Done | Table/JSON summaries of change-log entries for CI, stand-ups, or auditors. |
-| Diff UX | Color, side-by-side, pager integration | Planned | Keeps previews readable for large refactors; ANSI colors already ship today via `--color {auto,always,never}`. |
+| Diff UX | Color, side-by-side, pager integration | In progress | ANSI colors plus the built-in pager now ship; side-by-side layouts and HTML/export outputs remain on deck. |
 | Logging | Line-number aware log entries w/ rolling retention | Done | JSONL entries now include structured spans (modified vs added) alongside summaries, still capped at ~500 rows. |
 | Review UX | Interactive stepping (`--step`, `--line`) | Done | `safeedit review --step` now navigates line-by-line with next/prev/head/tail, `/pattern` searches, `n/N` match hopping, and single-letter bookmarks. |
 | Patch ingest | Apply external `.patch`/`.diff` files | Done | `safeedit apply --patch` parses unified diffs with diffy, previews each file, honors `--apply/--yes`, logs every action, and now handles same-path edits plus file adds/deletes/renames. |
@@ -207,8 +216,7 @@ Enable `RUST_LOG=safeedit=debug` when we add logging, and consider `cargo nextes
 - VS Code/Editor integration that shells out to `safeedit`.
 
 ## Follow-Up Issues (Nov 2025 Review)
-- **Unwired CLI flags:** `--after-line`, `--pager`, and `review --follow` are parsed/logged but have no behavior (`safeedit/src/main.rs:93-1235`, `safeedit/src/main.rs:1551-1697`, `safeedit/src/review.rs:90`). Either implement the promised viewer/stride logic or remove the flags from both the CLI and docs; track each flag separately so regression tests can verify them.
-- **Stubbed commands:** `block`, `rename`, and `script` only print summaries today (`safeedit/src/main.rs:817-1050`) even though the command table marks them implemented (`docs/safe_edit_tool_plan.md:30-34`). Decide whether to finish these flows (including file writes + diff previews) or explicitly move them to the roadmap with "Planned" status.
-- **Normalize skips binary guard + mixes detection toggles:** `handle_normalize` decodes every file regardless of `is_probably_binary` (`safeedit/src/main.rs:943`), and `detect_final_newline` is tied to trailing-space detection (`safeedit/src/main.rs:908`). Align behavior with `run_transform` (skip binary suspects, print warning) and allow each detection flag to operate independently.
+- **Batch runner/docs mismatch** (`safeedit/src/batch.rs:10-78`, `qa_sandbox/recipes/rename.yaml:1`): the CLI only understands `replace`/`normalize`, yet the plan and QA recipe reference `review`/`rename` steps. Decide whether to expand the enum or tighten documentation/examples so recipes reflect the actual parser.
+- **Planned commands:** `script` remains aspirational—either ship a concrete WASM/Lua/Python sandbox with preview-before-write semantics or keep it clearly labeled as "planned" so expectations stay aligned.
 
 This plan keeps the editing experience transparent, reviewable, and recoverable while giving us headroom to automate ever more complex transformations safely.

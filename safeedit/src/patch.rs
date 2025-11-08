@@ -72,6 +72,17 @@ fn split_segments(text: &str) -> Result<Vec<Segment>> {
     for chunk in text.split_inclusive('\n') {
         let cleaned = chunk.replace('\r', "");
         let trimmed = cleaned.trim_end_matches('\n');
+
+        if trimmed.starts_with("diff --") {
+            if in_segment {
+                finalize_segment(&mut segments, &mut buffer, &mut old_label, &mut new_label)?;
+                buffer.clear();
+                old_label = None;
+                new_label = None;
+                in_segment = false;
+            }
+            continue;
+        }
         if let Some(rest) = trimmed.strip_prefix("--- ") {
             if in_segment {
                 finalize_segment(&mut segments, &mut buffer, &mut old_label, &mut new_label)?;
@@ -193,6 +204,44 @@ index 111..222 100644
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].old_label, "a/foo.txt");
         assert_eq!(segments[1].new_label, "b/bar.txt");
+    }
+
+    #[test]
+    fn split_segments_handles_git_headers_between_files() {
+        let text = "\
+diff --git a/foo.txt b/foo.txt
+index 111..222 100644
+--- a/foo.txt
++++ b/foo.txt
+@@ -1,2 +1,3 @@
+ line1
+-line2
++line2 edit
++line3
+
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+";
+        let segments = split_segments(text).expect("segments");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].old_label, "a/foo.txt");
+        assert_eq!(segments[1].new_label, "b/new.txt");
+        assert!(
+            !segments[0].body.contains("diff --git"),
+            "first body should not include next diff header:\n{}",
+            segments[0].body
+        );
+        assert!(
+            !segments[1].body.contains("diff --git"),
+            "second body should not include diff header:\n{}",
+            segments[1].body
+        );
     }
 
     #[test]

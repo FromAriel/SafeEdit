@@ -1,0 +1,2 @@
+println!("generated block new");
+println!("extra");
