@@ -1,8 +1,8 @@
-# Safeedit
+# SafeEdit
 
-Safeedit is a Windows-friendly Rust CLI for applying complex text/code edits while guaranteeing preview-before-write semantics, deterministic targeting, and reversible, atomic changes. It’s designed as a safer, more powerful alternative to manual `apply_patch` workflows—especially for large refactors, multi-file replacements, or encoding cleanup jobs.
+SafeEdit is a Windows-friendly Rust CLI for applying complex text/code edits while guaranteeing preview-before-write semantics, deterministic targeting, and reversible, atomic changes. It’s designed as a safer, more powerful alternative to manual `apply_patch` workflows—especially for large refactors, multi-file replacements, or encoding cleanup jobs.
 
-## Why Safeedit?
+## Why SafeEdit?
 - **Preview-first:** Every edit renders a diff before touching disk. You can skip, apply once, or “apply all”.
 - **Deterministic targeting:** Literal, regex, and block operations include match guards (`--expect`, `--after-line`, etc.) plus helpful suggestions when nothing matches.
 - **Encoding aware:** Detects BOMs/encodings, preserves original line endings, and can convert troublesome files to UTF-8.
@@ -49,10 +49,10 @@ Additional niceties:
 ## Quick Start
 ```powershell
 # Preview first replacement (no files touched)
-safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello Safeedit"
+safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello SafeEdit"
 
 # Apply the change after review
-safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello Safeedit" --apply
+safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello SafeEdit" --apply
 
 # Rename identifiers across the project, preserving case
 safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware --apply
