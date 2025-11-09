@@ -15,12 +15,12 @@ SafeEdit is a Windows-friendly Rust CLI for applying complex text/code edits whi
 | --- | --- | --- |
 | `replace` | Literal/regex replacements with diff previews and match guards; accepts literal, stdin, clipboard, or heredoc (`--with-here TAG`) inputs. | `safeedit replace --target src --literal --pattern "foo" --with-here END` + pasted text ending in `END` |
 | `rename` | Case-aware identifier renames with word-boundary controls. | `safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware` |
-| `block` | Insert/replace multi-line regions bounded by markers (body from literals, files, stdin, clipboard, or heredocs via `--body-here TAG`). | `safeedit block --target file.rs --start-marker "// BEGIN" --end-marker "// END" --mode replace --body-here BODY` |
+| `block` | Insert/replace multi-line regions bounded by markers or single-line anchors via `--insert-after/--insert-before`, with heredoc (`--body-here`) inputs and `--expect-blocks` guards. (`--mode after/before` act as aliases for `insert`.) | `safeedit block --target file.rs --insert-after "fn main()" --body-here BODY` |
 | `write` | Create or overwrite files with diff previews, backups, and explicit line-ending controls—perfect for staging snippets. | `safeedit write --path snippets/helper.rs --body-here SNIP --line-ending crlf --apply` |
 | `apply` | Replay unified `.patch`/`.diff` files (modify/create/delete/rename) through the preview/approval pipeline while preserving original newline styles. | `safeedit apply --patch changes.diff --apply` |
 | `review` | Safe file viewing: `--head`, `--tail`, `--lines`, `--search`, `--step`, or long-running `--follow`. Built-in pager kicks in past ~200 diff lines. | `safeedit review --target app/main.rs --head 20 --search todo` |
 | `normalize` | Detect/repair zero-width chars, control chars, trailing spaces, final newlines, encoding mojibake, and convert encodings. | `safeedit normalize --target docs --trim-trailing-space --ensure-eol --convert-encoding utf-8 --apply` |
-| `batch` | Execute YAML/JSON “recipes” that chain supported verbs (`replace`, `normalize`) with shared review logging. | `safeedit batch qa_sandbox/recipes/rename.yaml --apply --yes` |
+| `batch` | Execute YAML/JSON “recipes” that chain supported verbs (`replace`, `block`, `rename`, `normalize`) with shared review logging. | `safeedit batch qa_sandbox/recipes/refactor.yaml --apply --yes` |
 | `report` | Summaries of logged edits for CI/standups (`table` or `json`). | `safeedit report --since 2025-11-08T14:00:00-07:00` |
 | `log` | Tail the rolling `.safeedit/change_log.jsonl` audit trail. | `safeedit log --tail 20` |
 | `cleanup` | Find/remove `.bak`/`.bakN` safety files once you’re confident in edits. | `safeedit cleanup --root . --apply --yes` |
@@ -62,6 +62,12 @@ safeedit block --target qa_sandbox/app/main.rs --start-marker "// BEGIN GENERATE
 println!("generated block");
 println!("extra");
 BLOCK
+# Anchor on a single line without an end marker and enforce a single hit
+safeedit block --target qa_sandbox/app/main.rs --insert-after 'fn main() {' --body-here BODY --expect-blocks 1
+println!("loggable step");
+BODY
+
+> PowerShell tip: wrap markers/start/end strings in single quotes (e.g., `'// BEGIN GENERATED'`) so embedded double quotes or parentheses aren't eaten by the shell.
 
 # Rename identifiers across the project, preserving case
 safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware --apply
@@ -73,15 +79,18 @@ safeedit apply --patch fix.diff --apply
 safeedit normalize --target docs --trim-trailing-space --ensure-eol --convert-encoding utf-8 --apply
 
 # Run a batch recipe that chains replace + normalize steps
-safeedit batch qa_sandbox/recipes/rename.yaml --apply --yes
+safeedit batch qa_sandbox/recipes/refactor.yaml --apply --yes
 
 # Inspect recent edits
 safeedit report --since 2025-11-08T15:00:00Z --format table
 safeedit log --tail 10
 ```
 
+> Reminder: Safeedit’s default dry-run preview **is** the review step—only add `--apply`/`--yes` (auto-apply) after you’ve looked at the diff. Auto-approve skips the safety prompt, so use it sparingly.
+
 ## Safety Mechanisms
 - **Diff previews everywhere** with `apply`/`skip` prompts and `--yes/--auto-apply` overrides for CI.
+- **Auto-apply caution:** `--apply` + `--yes/--auto-apply` skips the confirmation prompt; only use it once you’ve reviewed the diff.
 - **Atomic writes** via temp files + rename; backups rotate (`.bak`, `.bak1`, …) unless `--no-backup` is used.
 - **Undo artifacts**: `--undo-log <dir>` drops reverse patches you can replay with `patch -R`.
 - **Encoding fidelity**: detection respects BOM > chardet > UTF-8 fallback; newline preservation ensures CRLF files remain CRLF even after patches.

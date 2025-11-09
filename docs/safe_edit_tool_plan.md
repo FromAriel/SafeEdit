@@ -27,7 +27,7 @@ Deliver a Windows-friendly Rust CLI that performs complex text/code edits while 
 | --- | --- | --- |
 | `replace` | Replace a literal or regex match with supplied text. | `--regex`, `--literal`, `--count=N`, `--after-line`, `--encoding`, `--preview-context`, `--diff-only`, `--with-stdin`, `--with-clipboard`, `--with-here TAG` |
 | `apply` | Replay unified `.patch`/`.diff` files (mods + file create/delete) through the preview + approval loop. | `--patch <file>` (repeatable), `--root <dir>`, plus global `--apply/--yes/--context/--color` |
-| `block` | Insert/replace multi-line blocks anchored by sentinels. | `--start-marker`, `--end-marker`, `--mode={insert,replace}`, `--body (repeatable)/--body-file/--with-stdin/--with-clipboard/--body-here TAG` |
+| `block` | Insert/replace multi-line blocks anchored by sentinels or single-line anchors (`--insert-after/--insert-before`) with optional `--expect-blocks` guards; `--mode after/before` aliases map to `insert` for intuitive CLI usage. | `--start-marker`, `--end-marker`, `--insert-after`, `--insert-before`, `--mode={insert,replace}`, `--body*/--body-file/--with-stdin/--with-clipboard/--body-here`, `--expect-blocks` |
 | `write` | Create or overwrite files (great for staging snippets) using the same diff/backups/undo pipeline. | `--path <file>`, `--body/--body-file/--with-stdin/--with-clipboard/--body-here TAG`, `--allow-overwrite`, `--line-ending {auto,lf,crlf,cr}` |
 | `rename` | Rename identifiers/constants across files (case-preserving). | `--word-boundary`, `--case-aware`, `--target/--glob` |
 | `review` | Inspect files safely via head/tail, arbitrary line ranges, or interactive stepping. | `--head N`, `--tail N`, `--lines 120-160`, `--search`, `--highlight` |
@@ -47,6 +47,7 @@ The new `write` verb is intentionally simple: it exists so you can spin up snipp
   - `--glob <pattern>` (repeatable): add globbed matches on top of explicit targets.
   - `--include-hidden / --exclude <glob>` to control traversal.
   - `--encoding <auto|utf-8|utf-16-le|...>` override when detection is insufficient.
+- **Approval discipline**: `--apply` plus `--yes/--auto-apply` skips the review prompt—treat it as a power tool and only enable it after you’ve looked at the diff output.
 - `--match-limit <n>` guard for maximum replacements, `--expect <n>` for exact matches.
 - `--context <lines>` controls diff preview (default 3).
 - `--pager {auto,always,never}` toggles the integrated diff viewer (auto switches to 200-line pages once a diff exceeds ~200 lines, but falls back to inline when stdin/stdout are not interactive).
@@ -100,6 +101,7 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - **Miss diagnostics:** When zero matches, show suggestions like  
   `No exact match for "FooBar"; closest occurrences:` with line numbers/diff.
 - **Match guards:** `--expect <n>` fails if match count differs; `--max <n>` prevents runaway replacements.
+- **Block anchoring helpers:** `--insert-after/--insert-before` provide single-line anchors, previews now report the matched line span, and `--expect-blocks` enforces deterministic counts before prompting.
 - **Encoding handling:** Auto-detect via `chardetng` or BOM; manual override; diff output always UTF-8 to avoid mojibake.
 - **UNDO artifacts:** Save `*.undo.patch` (git-style) plus manifest referencing original files & checksums.
 - **Backups:** Optional `.bak` or timestamped copies; default on for non-git repos, configurable via `~/.safeedit.toml`.
@@ -176,7 +178,7 @@ The `review` command shares the preview loop but never writes; it simply paginat
 - Replace input ergonomics: `--diff-only` forces preview-only runs (even with `--apply`), while `--with-stdin` and `--with-clipboard` let us feed large replacements without wrestling with shell quoting.
 - Auto-approve summaries: replace/normalize now finish with a concise applied/skipped/dry-run/no-op report so unattended runs (e.g., `--yes`) still show what happened.
 - `safeedit report --since <ts>` condenses change-log entries into per-command/action summaries (table or JSON) so CI jobs or stand-ups can cite what happened without tailing raw logs.
-- Batch runner: `safeedit batch --plan plan.yml` loads YAML/JSON recipes (with per-step `common` overrides) and replays `replace`/`normalize` steps through the usual preview + approval loop, so multi-command refactors stay reviewable without ad-hoc scripts.
+- Batch runner: `safeedit batch --plan plan.yml` loads YAML/JSON recipes (with per-step `common` overrides) and replays `replace`/`block`/`rename`/`normalize` steps through the usual preview + approval loop, so multi-command refactors stay reviewable without ad-hoc scripts. The sample plan at `qa_sandbox/recipes/refactor.yaml` demonstrates the supported verbs end-to-end (including deterministic “reset then apply” pairs for replace/rename).
 - `safeedit report --since <ts>` condenses change-log entries into per-command/action summaries (table or JSON) so CI jobs or stand-ups can cite what happened without tailing raw logs.
 - `safeedit log --tail N` prints the most recent change-log entries (timestamp, command, action, line summary, path) so reviewers can quickly audit what changed without opening the JSONL file.
 - `safeedit apply --patch` ingests unified `.patch`/`.diff` files per target file, previews via the existing diff UI, honors `--apply/--yes`, records undo patches/log entries, and now supports same-path modifications plus file adds/deletes/renames.
@@ -219,7 +221,10 @@ Enable `RUST_LOG=safeedit=debug` when we add logging, and consider `cargo nextes
 - VS Code/Editor integration that shells out to `safeedit`.
 
 ## Follow-Up Issues (Nov 2025 Review)
-- **Batch runner/docs mismatch** (`safeedit/src/batch.rs:10-78`, `qa_sandbox/recipes/rename.yaml:1`): the CLI only understands `replace`/`normalize`, yet the plan and QA recipe reference `review`/`rename` steps. Decide whether to expand the enum or tighten documentation/examples so recipes reflect the actual parser.
-- **Planned commands:** `script` remains aspirational—either ship a concrete WASM/Lua/Python sandbox with preview-before-write semantics or keep it clearly labeled as "planned" so expectations stay aligned.
+- **Batch runner verb expansion (optional)** (`safeedit/src/batch.rs:10-120`): block + rename are now wired; consider adding `apply` (patch replay) or `review` steps if we need end-to-end refactors in a single plan, otherwise keep the current surface area documented.
+- **Planned commands:** `script` remains aspirational-either ship a concrete WASM/Lua/Python sandbox with preview-before-write semantics or keep it clearly labeled as "planned" so expectations stay aligned.
+- **PowerShell heredoc ampersands:** `block --body-here` still trips PowerShell’s `&` parsing even under `--%`. Document the workaround (`write --body-file` + `block --body-file`) and investigate a shell-neutral heredoc ingestion path so inline bodies with `&` don’t require temp files.
 
 This plan keeps the editing experience transparent, reviewable, and recoverable while giving us headroom to automate ever more complex transformations safely.
+
+> Reminder: the review-first workflow is the safety net. Keep `--apply`/`--yes` for moments when you’ve already inspected the diff; auto-apply intentionally bypasses the prompt.

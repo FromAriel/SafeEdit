@@ -16,6 +16,8 @@ pub struct BatchPlan {
 pub enum PlanEntry {
     Replace(ReplacePlan),
     Normalize(NormalizePlan),
+    Block(BlockPlan),
+    Rename(RenamePlan),
 }
 
 impl PlanEntry {
@@ -23,6 +25,8 @@ impl PlanEntry {
         match self {
             PlanEntry::Replace(_) => "replace",
             PlanEntry::Normalize(_) => "normalize",
+            PlanEntry::Block(_) => "block",
+            PlanEntry::Rename(_) => "rename",
         }
     }
 }
@@ -98,6 +102,32 @@ pub struct NormalizePlan {
     pub scan_trailing_space: Option<bool>,
     #[serde(default)]
     pub scan_final_newline: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BlockPlan {
+    #[serde(default)]
+    pub common: PlanCommon,
+    pub body: Option<String>,
+    pub body_file: Option<PathBuf>,
+    pub start_marker: Option<String>,
+    pub end_marker: Option<String>,
+    pub insert_after: Option<String>,
+    pub insert_before: Option<String>,
+    pub mode: Option<String>,
+    pub expect_blocks: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenamePlan {
+    #[serde(default)]
+    pub common: PlanCommon,
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub word_boundary: bool,
+    #[serde(default)]
+    pub case_aware: bool,
 }
 
 pub fn load_plan(path: &Path) -> Result<BatchPlan> {

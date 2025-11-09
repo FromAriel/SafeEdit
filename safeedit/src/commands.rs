@@ -17,11 +17,36 @@ pub struct ReplaceOptions {
 }
 
 #[derive(Debug, Clone)]
+pub enum BlockTarget {
+    Range { start: String, end: String },
+    InsertAfter { marker: String },
+    InsertBefore { marker: String },
+}
+
+impl BlockTarget {
+    pub fn describe(&self) -> String {
+        match self {
+            BlockTarget::Range { start, end } => format!(
+                "range start=\"{}\" end=\"{}\"",
+                preview_marker(start),
+                preview_marker(end)
+            ),
+            BlockTarget::InsertAfter { marker } => {
+                format!("insert-after \"{}\"", preview_marker(marker))
+            }
+            BlockTarget::InsertBefore { marker } => {
+                format!("insert-before \"{}\"", preview_marker(marker))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BlockOptions {
-    pub start_marker: String,
-    pub end_marker: String,
+    pub target: BlockTarget,
     pub mode: BlockMode,
     pub body: String,
+    pub expect: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,23 +157,17 @@ fn apply_replace(decoded: &DecodedText, options: &ReplaceOptions) -> Result<Opti
 
 fn apply_block(decoded: &DecodedText, options: &BlockOptions) -> Result<Option<String>> {
     let text = &decoded.text;
-    let Some(start_pos) = text.find(&options.start_marker) else {
-        bail!("start marker '{}' not found", options.start_marker);
-    };
-    let after_start = start_pos + options.start_marker.len();
-    let Some(rel_end) = text[after_start..].find(&options.end_marker) else {
-        bail!(
-            "end marker '{}' not found after start marker",
-            options.end_marker
-        );
-    };
-    let end_pos = after_start + rel_end;
-    let existing = &text[after_start..end_pos];
+    let line_index = LineIndex::new(text);
+    let location = locate_block_region(text, &options.target, &line_index)?;
+    enforce_block_expectation(options.expect, location.match_count)?;
+    announce_block_match(&location);
+
+    let existing = &text[location.insert_start..location.insert_end];
     if matches!(options.mode, BlockMode::Insert) && !existing.trim().is_empty() {
         bail!("insert mode requires the block region to be empty");
     }
 
-    let indent = block_indent(text, start_pos);
+    let indent = block_indent(text, location.indent_anchor);
     let desired = adjust_block_body(existing, &options.body, text, &indent);
 
     if existing == desired {
@@ -157,15 +176,174 @@ fn apply_block(decoded: &DecodedText, options: &BlockOptions) -> Result<Option<S
 
     let mut new_text =
         String::with_capacity(text.len().saturating_sub(existing.len()) + desired.len());
-    new_text.push_str(&text[..after_start]);
+    new_text.push_str(&text[..location.insert_start]);
     new_text.push_str(&desired);
-    new_text.push_str(&text[end_pos..]);
+    new_text.push_str(&text[location.insert_end..]);
 
     if new_text == decoded.text {
         return Ok(None);
     }
 
     Ok(Some(new_text))
+}
+
+struct BlockMatchInfo {
+    indent_anchor: usize,
+    insert_start: usize,
+    insert_end: usize,
+    match_count: usize,
+    start_line: usize,
+    end_line: usize,
+    summary: String,
+}
+
+fn locate_block_region(
+    text: &str,
+    target: &BlockTarget,
+    lines: &LineIndex,
+) -> Result<BlockMatchInfo> {
+    match target {
+        BlockTarget::Range { start, end } => locate_block_range(text, start, end, lines),
+        BlockTarget::InsertAfter { marker } => locate_insert_after(text, marker, lines),
+        BlockTarget::InsertBefore { marker } => locate_insert_before(text, marker, lines),
+    }
+}
+
+fn locate_block_range(
+    text: &str,
+    start_marker: &str,
+    end_marker: &str,
+    lines: &LineIndex,
+) -> Result<BlockMatchInfo> {
+    if start_marker.is_empty() {
+        bail!("start marker cannot be empty");
+    }
+    if end_marker.is_empty() {
+        bail!("end marker cannot be empty");
+    }
+    let matches = count_occurrences(text, start_marker);
+    if matches == 0 {
+        bail!("start marker '{start_marker}' not found");
+    }
+    let start_pos = text
+        .find(start_marker)
+        .expect("start marker must exist after count");
+    let after_start = start_pos + start_marker.len();
+    let Some(rel_end) = text[after_start..].find(end_marker) else {
+        bail!("end marker '{end_marker}' not found after start marker");
+    };
+    let end_pos = after_start + rel_end;
+    Ok(BlockMatchInfo {
+        indent_anchor: start_pos,
+        insert_start: after_start,
+        insert_end: end_pos,
+        match_count: matches,
+        start_line: lines.line_at(start_pos),
+        end_line: lines.line_at(end_pos),
+        summary: format!(
+            "start \"{}\" / end \"{}\"",
+            preview_marker(start_marker),
+            preview_marker(end_marker)
+        ),
+    })
+}
+
+fn locate_insert_after(text: &str, marker: &str, lines: &LineIndex) -> Result<BlockMatchInfo> {
+    if marker.is_empty() {
+        bail!("insert-after marker cannot be empty");
+    }
+    let matches = count_occurrences(text, marker);
+    if matches == 0 {
+        bail!("insert-after marker '{marker}' not found");
+    }
+    let marker_start = text.find(marker).expect("marker present after count");
+    let after_marker = marker_start + marker.len();
+    let insert_start = find_line_end(text, after_marker);
+    Ok(BlockMatchInfo {
+        indent_anchor: marker_start,
+        insert_start,
+        insert_end: insert_start,
+        match_count: matches,
+        start_line: lines.line_at(marker_start),
+        end_line: lines.line_at(marker_start),
+        summary: format!("insert-after \"{}\"", preview_marker(marker)),
+    })
+}
+
+fn locate_insert_before(text: &str, marker: &str, lines: &LineIndex) -> Result<BlockMatchInfo> {
+    if marker.is_empty() {
+        bail!("insert-before marker cannot be empty");
+    }
+    let matches = count_occurrences(text, marker);
+    if matches == 0 {
+        bail!("insert-before marker '{marker}' not found");
+    }
+    let marker_start = text.find(marker).expect("marker present after count");
+    let line_start = text[..marker_start]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    Ok(BlockMatchInfo {
+        indent_anchor: marker_start,
+        insert_start: line_start,
+        insert_end: line_start,
+        match_count: matches,
+        start_line: lines.line_at(marker_start),
+        end_line: lines.line_at(marker_start),
+        summary: format!("insert-before \"{}\"", preview_marker(marker)),
+    })
+}
+
+fn enforce_block_expectation(expect: Option<usize>, actual: usize) -> Result<()> {
+    if let Some(expected) = expect {
+        if actual != expected {
+            bail!("expected {expected} block match(es) but found {actual}");
+        }
+    }
+    Ok(())
+}
+
+fn announce_block_match(info: &BlockMatchInfo) {
+    let line_desc = if info.start_line == info.end_line {
+        format!("line {}", info.start_line)
+    } else {
+        format!("lines {}-{}", info.start_line, info.end_line)
+    };
+    if info.match_count == 1 {
+        println!("block: found 1 match for {} at {line_desc}", info.summary);
+    } else {
+        println!(
+            "block: found {} matches for {}; editing the first at {line_desc}",
+            info.match_count, info.summary
+        );
+    }
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack.match_indices(needle).count()
+}
+
+fn find_line_end(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len();
+    }
+    match text[offset..].find('\n') {
+        Some(idx) => offset + idx + 1,
+        None => text.len(),
+    }
+}
+
+fn preview_marker(marker: &str) -> String {
+    const LIMIT: usize = 40;
+    let escaped: String = marker.escape_debug().collect();
+    if escaped.chars().count() > LIMIT {
+        escaped.chars().take(LIMIT).collect::<String>() + "…"
+    } else {
+        escaped
+    }
 }
 
 fn adjust_block_body(existing: &str, requested: &str, full_text: &str, indent: &str) -> String {
@@ -276,7 +454,7 @@ fn block_indent(text: &str, marker_start: usize) -> String {
         .rfind('\n')
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    text[line_start..marker_start]
+    text[line_start..]
         .chars()
         .take_while(|c| matches!(c, ' ' | '\t'))
         .collect()
@@ -676,10 +854,13 @@ mod tests {
     fn block_replace_swaps_body() {
         let decoded = decoded_text("/*start*/\nold\n/*end*/");
         let options = BlockOptions {
-            start_marker: "/*start*/".into(),
-            end_marker: "/*end*/".into(),
+            target: BlockTarget::Range {
+                start: "/*start*/".into(),
+                end: "/*end*/".into(),
+            },
             mode: BlockMode::Replace,
             body: "\nnew\n".into(),
+            expect: None,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -691,10 +872,13 @@ mod tests {
     fn block_replace_injects_missing_linebreaks() {
         let decoded = decoded_text("// begin\nold\n// end\n");
         let options = BlockOptions {
-            start_marker: "// begin".into(),
-            end_marker: "// end".into(),
+            target: BlockTarget::Range {
+                start: "// begin".into(),
+                end: "// end".into(),
+            },
             mode: BlockMode::Replace,
             body: "updated line".into(),
+            expect: None,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -706,10 +890,13 @@ mod tests {
     fn block_replace_keeps_inline_segments_flat() {
         let decoded = decoded_text("/*start*/old/*end*/");
         let options = BlockOptions {
-            start_marker: "/*start*/".into(),
-            end_marker: "/*end*/".into(),
+            target: BlockTarget::Range {
+                start: "/*start*/".into(),
+                end: "/*end*/".into(),
+            },
             mode: BlockMode::Replace,
             body: "new".into(),
+            expect: None,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -721,13 +908,66 @@ mod tests {
     fn block_insert_errors_when_region_not_empty() {
         let decoded = decoded_text("// begin\nkeep\n// end");
         let options = BlockOptions {
-            start_marker: "// begin".into(),
-            end_marker: "// end".into(),
+            target: BlockTarget::Range {
+                start: "// begin".into(),
+                end: "// end".into(),
+            },
             mode: BlockMode::Insert,
             body: "\nnew\n".into(),
+            expect: None,
         };
         let err = apply_block(&decoded, &options).expect_err("should fail");
         assert!(format!("{err:#}").contains("insert mode"));
+    }
+
+    #[test]
+    fn block_insert_after_appends_block() {
+        let decoded = decoded_text("// marker\nnext line\n");
+        let options = BlockOptions {
+            target: BlockTarget::InsertAfter {
+                marker: "// marker".into(),
+            },
+            mode: BlockMode::Insert,
+            body: "    inserted();\n".into(),
+            expect: None,
+        };
+        let updated = apply_block(&decoded, &options)
+            .expect("block")
+            .expect("text");
+        assert_eq!(updated, "// marker\n    inserted();\nnext line\n");
+    }
+
+    #[test]
+    fn block_insert_before_preserves_indent() {
+        let decoded = decoded_text("    target();\n");
+        let options = BlockOptions {
+            target: BlockTarget::InsertBefore {
+                marker: "    target();".into(),
+            },
+            mode: BlockMode::Insert,
+            body: "println!(\"hi\");\n".into(),
+            expect: Some(1),
+        };
+        let updated = apply_block(&decoded, &options)
+            .expect("block")
+            .expect("text");
+        assert_eq!(updated, "    println!(\"hi\");\n    target();\n");
+    }
+
+    #[test]
+    fn block_expect_blocks_enforced() {
+        let decoded = decoded_text("/*start*/keep/*end*/");
+        let options = BlockOptions {
+            target: BlockTarget::Range {
+                start: "/*start*/".into(),
+                end: "/*end*/".into(),
+            },
+            mode: BlockMode::Replace,
+            body: "keep".into(),
+            expect: Some(2),
+        };
+        let err = apply_block(&decoded, &options).expect_err("mismatch");
+        assert!(format!("{err:#}").contains("expected 2 block"));
     }
 
     fn decoded_text(text: &str) -> DecodedText {

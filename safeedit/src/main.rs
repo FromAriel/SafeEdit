@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
@@ -25,7 +26,9 @@ mod normalize;
 mod patch;
 mod review;
 mod transform;
-use commands::{BlockOptions, RenameOptions, ReplaceOptions, run_block, run_rename, run_replace};
+use commands::{
+    BlockOptions, BlockTarget, RenameOptions, ReplaceOptions, run_block, run_rename, run_replace,
+};
 use encoding::{DecodedText, EncodingStrategy};
 use files::{FileEntry, FileMetadata};
 use logging::{LineSpan, LineSpanKind, record_change};
@@ -1083,7 +1086,8 @@ fn read_heredoc_input(tag: &str, description: &str) -> Result<String> {
     if tag.trim().is_empty() {
         bail!("heredoc terminator cannot be empty");
     }
-    println!("Enter {description}; finish with a line containing only {tag}.");
+    println!();
+    println!("Enter {description} below. Finish with a line containing only {tag}.");
     let mut buf = String::new();
     let mut line = String::new();
     loop {
@@ -1108,25 +1112,26 @@ fn handle_block(cmd: BlockCommand) -> Result<()> {
     let diff_config = cmd.common.diff_display_config(colorize);
     let entries = resolve_entries(&cmd.common)?;
     let encoding = resolve_encoding_strategy(&cmd.common)?;
+    let target = cmd.build_target()?;
+    let mode = cmd.resolve_mode(&target)?;
+    let target_summary = target.describe();
+    let expect_blocks = cmd.expect_blocks;
     let (body_text, body_source) = resolve_block_body(&cmd)?;
-    print_command_summary(
-        "block",
-        &cmd.common,
-        &encoding,
-        &entries,
-        &[
-            format!("start_marker={}", cmd.start_marker),
-            format!("end_marker={}", cmd.end_marker),
-            format!("mode={:?}", cmd.mode),
-            format!("body_source={body_source}"),
-            format!("body_length={} chars", body_text.chars().count()),
-        ],
-    );
+    let mut details = vec![
+        format!("target={target_summary}"),
+        format!("mode={mode:?}"),
+        format!("body_source={body_source}"),
+        format!("body_length={} chars", body_text.chars().count()),
+    ];
+    if let Some(expect) = expect_blocks {
+        details.push(format!("expect_blocks={expect}"));
+    }
+    print_command_summary("block", &cmd.common, &encoding, &entries, &details);
     let options = BlockOptions {
-        start_marker: cmd.start_marker.clone(),
-        end_marker: cmd.end_marker.clone(),
-        mode: cmd.mode,
+        target,
+        mode,
         body: body_text,
+        expect: expect_blocks,
     };
     let apply_mode = cmd.common.apply;
     let mut apply_all = cmd.common.auto_apply && apply_mode;
@@ -1845,6 +1850,14 @@ fn handle_batch(cmd: BatchCommand) -> Result<()> {
             batch::PlanEntry::Normalize(step_plan) => {
                 let normalize_cmd = build_normalize_command(&common, step_plan)?;
                 handle_normalize(normalize_cmd)?;
+            }
+            batch::PlanEntry::Block(step_plan) => {
+                let block_cmd = build_block_command(&common, step_plan)?;
+                handle_block(block_cmd)?;
+            }
+            batch::PlanEntry::Rename(step_plan) => {
+                let rename_cmd = build_rename_command(&common, step_plan)?;
+                handle_rename(rename_cmd)?;
             }
         }
     }
@@ -2682,6 +2695,59 @@ fn build_normalize_command(
     })
 }
 
+fn build_block_command(base_common: &CommonArgs, step: &batch::BlockPlan) -> Result<BlockCommand> {
+    if step.body.is_none() && step.body_file.is_none() {
+        bail!("block step requires a 'body' string or 'body_file'");
+    }
+    if step.start_marker.is_some() ^ step.end_marker.is_some() {
+        bail!("block step requires both start_marker and end_marker");
+    }
+    if step.insert_after.is_some() && step.insert_before.is_some() {
+        bail!("block step cannot set both insert_after and insert_before");
+    }
+    if step.start_marker.is_none() && step.insert_after.is_none() && step.insert_before.is_none() {
+        bail!("block step must supply start/end markers or one of insert-after/insert-before");
+    }
+    let mode = match &step.mode {
+        Some(mode) => Some(
+            BlockMode::from_str(mode)
+                .map_err(|err| anyhow!("invalid block mode '{mode}': {err}"))?,
+        ),
+        None => None,
+    };
+    Ok(BlockCommand {
+        common: merge_common(base_common, &step.common),
+        start_marker: step.start_marker.clone(),
+        end_marker: step.end_marker.clone(),
+        insert_after: step.insert_after.clone(),
+        insert_before: step.insert_before.clone(),
+        mode,
+        body: step
+            .body
+            .as_ref()
+            .map(|text| vec![text.clone()])
+            .unwrap_or_default(),
+        body_file: step.body_file.clone(),
+        with_stdin: false,
+        with_clipboard: false,
+        body_here: None,
+        expect_blocks: step.expect_blocks,
+    })
+}
+
+fn build_rename_command(
+    base_common: &CommonArgs,
+    step: &batch::RenamePlan,
+) -> Result<RenameCommand> {
+    Ok(RenameCommand {
+        common: merge_common(base_common, &step.common),
+        from: step.from.clone(),
+        to: step.to.clone(),
+        word_boundary: step.word_boundary,
+        case_aware: step.case_aware,
+    })
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "safeedit", version, about = "Safe file editing companion")]
 struct Cli {
@@ -2713,9 +2779,17 @@ struct CommonArgs {
     targets: Vec<PathBuf>,
     #[arg(long, value_name = "ENCODING")]
     encoding: Option<String>,
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Write changes after showing the diff; omit to stay in review-only dry-run mode."
+    )]
     apply: bool,
-    #[arg(long = "yes", action = ArgAction::SetTrue)]
+    #[arg(
+        long = "yes",
+        action = ArgAction::SetTrue,
+        help = "Approve every diff without prompting (skips the review step); use only after inspecting output."
+    )]
     auto_apply: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     no_backup: bool,
@@ -2805,12 +2879,35 @@ struct ApplyCommand {
 struct BlockCommand {
     #[command(flatten)]
     common: CommonArgs,
-    #[arg(long = "start-marker", value_name = "TEXT")]
-    start_marker: String,
-    #[arg(long = "end-marker", value_name = "TEXT")]
-    end_marker: String,
-    #[arg(long, value_name = "MODE", default_value = "replace")]
-    mode: BlockMode,
+    #[arg(
+        long = "start-marker",
+        value_name = "TEXT",
+        conflicts_with_all = ["insert_after", "insert_before"],
+        required_unless_present_any = ["insert_after", "insert_before"]
+    )]
+    start_marker: Option<String>,
+    #[arg(
+        long = "end-marker",
+        value_name = "TEXT",
+        requires = "start_marker",
+        conflicts_with_all = ["insert_after", "insert_before"],
+        required_unless_present_any = ["insert_after", "insert_before"]
+    )]
+    end_marker: Option<String>,
+    #[arg(
+        long = "insert-after",
+        value_name = "TEXT",
+        conflicts_with_all = ["start_marker", "end_marker", "insert_before"]
+    )]
+    insert_after: Option<String>,
+    #[arg(
+        long = "insert-before",
+        value_name = "TEXT",
+        conflicts_with_all = ["start_marker", "end_marker", "insert_after"]
+    )]
+    insert_before: Option<String>,
+    #[arg(long, value_name = "MODE")]
+    mode: Option<BlockMode>,
     #[arg(
         long = "body",
         value_name = "TEXT",
@@ -2832,6 +2929,47 @@ struct BlockCommand {
     with_clipboard: bool,
     #[arg(long = "body-here", value_name = "TAG", conflicts_with_all = ["body", "body_file", "with_stdin", "with_clipboard"])]
     body_here: Option<String>,
+    #[arg(long = "expect-blocks", value_name = "N")]
+    expect_blocks: Option<usize>,
+}
+
+impl BlockCommand {
+    fn build_target(&self) -> Result<BlockTarget> {
+        match (
+            &self.start_marker,
+            &self.end_marker,
+            &self.insert_after,
+            &self.insert_before,
+        ) {
+            (Some(start), Some(end), None, None) => Ok(BlockTarget::Range {
+                start: start.clone(),
+                end: end.clone(),
+            }),
+            (None, None, Some(marker), None) => Ok(BlockTarget::InsertAfter {
+                marker: marker.clone(),
+            }),
+            (None, None, None, Some(marker)) => Ok(BlockTarget::InsertBefore {
+                marker: marker.clone(),
+            }),
+            _ => bail!(
+                "provide --start-marker/--end-marker or exactly one of --insert-after/--insert-before"
+            ),
+        }
+    }
+
+    fn resolve_mode(&self, target: &BlockTarget) -> Result<BlockMode> {
+        let requested = self.mode.unwrap_or(BlockMode::Replace);
+        if matches!(
+            target,
+            BlockTarget::InsertAfter { .. } | BlockTarget::InsertBefore { .. }
+        ) {
+            if matches!(self.mode, Some(BlockMode::Replace)) {
+                bail!("--insert-after/--insert-before only support insert mode");
+            }
+            return Ok(BlockMode::Insert);
+        }
+        Ok(requested)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2845,9 +2983,9 @@ impl std::str::FromStr for BlockMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "insert" => Ok(Self::Insert),
+            "insert" | "after" | "before" => Ok(Self::Insert),
             "replace" => Ok(Self::Replace),
-            _ => Err("expected 'insert' or 'replace'"),
+            _ => Err("expected 'insert', 'replace', 'after', or 'before'"),
         }
     }
 }

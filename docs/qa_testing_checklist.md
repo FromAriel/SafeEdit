@@ -15,7 +15,7 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
   - `docs/readme.md` with a few paragraphs plus intentional trailing spaces.
   - `notes/encodings/latin1.txt` saved in Latin-1 with accented characters.
   - `logs/huge_line.txt` holding a single 200 KB line to stress guardrails.
-- [ ] Create `recipes/rename.yaml` that chains the supported batch verbs (`replace` + `normalize`) so both flows run in a single plan.
+- [ ] Verify `recipes/refactor.yaml` exists with the full demo plan (double replace reset/apply, block body swap, rename reset/apply, normalize cleanup) so every supported batch verb is exercised.
 - [ ] Use `safeedit write --path qa_sandbox/block_body.txt --body 'println!("generated block");' --body 'println!("extra");' --line-ending crlf --apply` to generate a reusable snippet file; re-run with `--allow-overwrite` to confirm the diff/backup flow when overwriting.
 - [ ] Confirm each edited file gains a `.bak` sibling (Safeedit should create/increment backups automatically).
 
@@ -41,6 +41,8 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
 - [ ] Reuse the snippet created via `safeedit write` by running `block --body-file qa_sandbox/block_body.txt` to confirm the workflow for multi-line replacements without wrestling with PowerShell quoting.
 - [ ] Run `block --body-here BLOCK` and type a few lines manually, ending with `BLOCK`, to validate heredoc capture.
 - [ ] Insert a block between `// BEGIN GENERATED` and `// END GENERATED`; confirm multi-line diff readability.
+- [ ] Use `--insert-after "fn main()"` (no end marker) to append instrumentation and ensure indentation matches the anchor line.
+- [ ] Use `--insert-before` to prepend content above an indented line; pair it with `--expect-blocks 1` to confirm deterministic guardrails.
 - [ ] Switch to `--mode replace` and ensure existing blocks are replaced, not duplicated.
 - [ ] Run without markers to verify the error includes nearby context hints.
 
@@ -56,7 +58,7 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
 - [ ] Ensure suspected binary files are skipped with an explicit warning (unless an override flag is supplied).
 
 ## 9. Batch Recipes
-- [ ] Execute `safeedit batch --plan qa_sandbox/recipes/rename.yaml`; confirm the `replace` and `normalize` steps each show their previews/approvals and respect global flags.
+- [ ] Execute `safeedit batch --plan qa_sandbox/recipes/refactor.yaml`; confirm each replace, block, rename, and normalize step shows its preview/approval loop and respects global flags.
 - [ ] Break the batch (invalid step) to ensure the runner reports the failing command and halts subsequent steps.
 
 ## 10. Reporting, Logging, Cleanup

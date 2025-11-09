@@ -1,0 +1,46 @@
+steps:
+  - command: replace
+    pattern: "hello Safeedit QA"
+    replacement: "hello QA"
+    common:
+      targets:
+        - qa_sandbox/app/main.rs
+  - command: replace
+    pattern: "hello QA"
+    replacement: "hello Safeedit QA"
+    expect: 1
+    common:
+      targets:
+        - qa_sandbox/app/main.rs
+  - command: block
+    start_marker: "// BEGIN GENERATED"
+    end_marker: "// END GENERATED"
+    mode: replace
+    body_file: qa_sandbox/block_body.txt
+    expect_blocks: 1
+    common:
+      targets:
+        - qa_sandbox/app/main.rs
+  - command: rename
+    from: APP_RELEASE
+    to: APP_VERSION
+    word_boundary: true
+    case_aware: true
+    common:
+      targets:
+        - qa_sandbox/app/lib/utils.rs
+  - command: rename
+    from: APP_VERSION
+    to: APP_RELEASE
+    word_boundary: true
+    case_aware: true
+    common:
+      targets:
+        - qa_sandbox/app/lib/utils.rs
+  - command: normalize
+    trim_trailing_space: true
+    ensure_eol: true
+    scan_trailing_space: true
+    common:
+      targets:
+        - qa_sandbox/docs/readme.md
