@@ -13,9 +13,10 @@ SafeEdit is a Windows-friendly Rust CLI for applying complex text/code edits whi
 ## Feature Highlights
 | Command | Purpose | Example |
 | --- | --- | --- |
-| `replace` | Literal/regex replacements with diff previews and match guards. | `safeedit replace --target src --literal --pattern "foo" --with "bar" --expect 3` |
+| `replace` | Literal/regex replacements with diff previews and match guards; accepts literal, stdin, clipboard, or heredoc (`--with-here TAG`) inputs. | `safeedit replace --target src --literal --pattern "foo" --with-here END` + pasted text ending in `END` |
 | `rename` | Case-aware identifier renames with word-boundary controls. | `safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware` |
-| `block` | Insert/replace multi-line regions bounded by markers. | `safeedit block --target file.rs --start-marker "// BEGIN" --end-marker "// END" --mode replace --body-file new_block.txt` |
+| `block` | Insert/replace multi-line regions bounded by markers (body from literals, files, stdin, clipboard, or heredocs via `--body-here TAG`). | `safeedit block --target file.rs --start-marker "// BEGIN" --end-marker "// END" --mode replace --body-here BODY` |
+| `write` | Create or overwrite files with diff previews, backups, and explicit line-ending controls—perfect for staging snippets. | `safeedit write --path snippets/helper.rs --body-here SNIP --line-ending crlf --apply` |
 | `apply` | Replay unified `.patch`/`.diff` files (modify/create/delete/rename) through the preview/approval pipeline while preserving original newline styles. | `safeedit apply --patch changes.diff --apply` |
 | `review` | Safe file viewing: `--head`, `--tail`, `--lines`, `--search`, `--step`, or long-running `--follow`. Built-in pager kicks in past ~200 diff lines. | `safeedit review --target app/main.rs --head 20 --search todo` |
 | `normalize` | Detect/repair zero-width chars, control chars, trailing spaces, final newlines, encoding mojibake, and convert encodings. | `safeedit normalize --target docs --trim-trailing-space --ensure-eol --convert-encoding utf-8 --apply` |
@@ -53,6 +54,14 @@ safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello S
 
 # Apply the change after review
 safeedit replace --target src/lib.rs --literal --pattern "hello" --with "hello SafeEdit" --apply
+
+# Seed a snippet file for block insertions (with explicit CRLF endings)
+safeedit write --path qa_sandbox/block_body.txt --body 'println!("generated block");' --body 'println!("extra");' --line-ending crlf --apply
+# Or capture multi-line text interactively via heredoc
+safeedit block --target qa_sandbox/app/main.rs --start-marker "// BEGIN GENERATED" --end-marker "// END GENERATED" --mode replace --body-here BLOCK
+println!("generated block");
+println!("extra");
+BLOCK
 
 # Rename identifiers across the project, preserving case
 safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware --apply

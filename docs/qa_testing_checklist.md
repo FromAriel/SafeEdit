@@ -16,6 +16,7 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
   - `notes/encodings/latin1.txt` saved in Latin-1 with accented characters.
   - `logs/huge_line.txt` holding a single 200 KB line to stress guardrails.
 - [ ] Create `recipes/rename.yaml` that chains the supported batch verbs (`replace` + `normalize`) so both flows run in a single plan.
+- [ ] Use `safeedit write --path qa_sandbox/block_body.txt --body 'println!("generated block");' --body 'println!("extra");' --line-ending crlf --apply` to generate a reusable snippet file; re-run with `--allow-overwrite` to confirm the diff/backup flow when overwriting.
 - [ ] Confirm each edited file gains a `.bak` sibling (Safeedit should create/increment backups automatically).
 
 ## 3. Review Command Coverage
@@ -28,6 +29,7 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
 ## 4. Replace / Regex Editing
 - [ ] Literal replace: change `hello QA` to `hello Safeedit QA`; preview diff, `--apply`, and verify `.bak` plus undo artifacts exist.
 - [ ] Regex replace: `replace --regex --pattern "(0\.1\.0)" --replace "0.2.0"` across `qa_sandbox/**/*.rs` with `--expect 1`; confirm deterministic targeting.
+- [ ] Exercise the heredoc path: `replace --literal --pattern "helper" --with-here END` (paste multi-line text, finish with `END`) to ensure interactive capture works and diff previews show the full body.
 - [ ] Negative case: misspell the pattern and ensure the tool surfaces closest-match context instead of silently succeeding.
 
 ## 5. Rename Command
@@ -36,6 +38,8 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
 - [ ] `safeedit log --tail 5` should list touched files and line spans.
 
 ## 6. Block Command
+- [ ] Reuse the snippet created via `safeedit write` by running `block --body-file qa_sandbox/block_body.txt` to confirm the workflow for multi-line replacements without wrestling with PowerShell quoting.
+- [ ] Run `block --body-here BLOCK` and type a few lines manually, ending with `BLOCK`, to validate heredoc capture.
 - [ ] Insert a block between `// BEGIN GENERATED` and `// END GENERATED`; confirm multi-line diff readability.
 - [ ] Switch to `--mode replace` and ensure existing blocks are replaced, not duplicated.
 - [ ] Run without markers to verify the error includes nearby context hints.

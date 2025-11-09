@@ -25,9 +25,10 @@ Deliver a Windows-friendly Rust CLI that performs complex text/code edits while 
 ## Command Surface (Initial)
 | Command | Purpose | Key Flags |
 | --- | --- | --- |
-| `replace` | Replace a literal or regex match with supplied text. | `--regex`, `--literal`, `--count=N`, `--after-line`, `--encoding`, `--preview-context`, `--diff-only`, `--with-stdin`, `--with-clipboard` |
+| `replace` | Replace a literal or regex match with supplied text. | `--regex`, `--literal`, `--count=N`, `--after-line`, `--encoding`, `--preview-context`, `--diff-only`, `--with-stdin`, `--with-clipboard`, `--with-here TAG` |
 | `apply` | Replay unified `.patch`/`.diff` files (mods + file create/delete) through the preview + approval loop. | `--patch <file>` (repeatable), `--root <dir>`, plus global `--apply/--yes/--context/--color` |
-| `block` | Insert/replace multi-line blocks anchored by sentinels. | `--start-marker`, `--end-marker`, `--mode={insert,replace}`, `--body (repeatable)/--body-file/--with-stdin/--with-clipboard` |
+| `block` | Insert/replace multi-line blocks anchored by sentinels. | `--start-marker`, `--end-marker`, `--mode={insert,replace}`, `--body (repeatable)/--body-file/--with-stdin/--with-clipboard/--body-here TAG` |
+| `write` | Create or overwrite files (great for staging snippets) using the same diff/backups/undo pipeline. | `--path <file>`, `--body/--body-file/--with-stdin/--with-clipboard/--body-here TAG`, `--allow-overwrite`, `--line-ending {auto,lf,crlf,cr}` |
 | `rename` | Rename identifiers/constants across files (case-preserving). | `--word-boundary`, `--case-aware`, `--target/--glob` |
 | `review` | Inspect files safely via head/tail, arbitrary line ranges, or interactive stepping. | `--head N`, `--tail N`, `--lines 120-160`, `--search`, `--highlight` |
 | `normalize` | Detect and fix encoding/mojibake/zero-width issues in text files without destructive rewrites. | `--encoding auto`, `--strip-zero-width`, `--strip-control`, `--trim-trailing-space`, `--ensure-eol`, `--scan-{encoding,zero-width,control,trailing-space}`, `--report-format {table,json}`, `--convert-encoding <target>`, `--apply` |
@@ -37,6 +38,8 @@ Deliver a Windows-friendly Rust CLI that performs complex text/code edits while 
 | `cleanup` | Remove stale `.bak`, `.bakN` safety copies with preview + approval. | `--root <dir>`, `--apply`, `--yes`, `--include-hidden` |
 
 All commands accept `--dry-run` (default true), `--apply` (skip prompt for automation), `--undo-log <dir>`, `--no-backup`, and `--pager {auto,always,never}` (auto = inline until diffs exceed 200 lines, then switch to the built-in viewer).
+
+The new `write` verb is intentionally simple: it exists so you can spin up snippet files (or regenerate them with `--allow-overwrite`) without fighting shell quoting. It uses the same diff-preview/backup/undo machinery as other commands and adds a `--line-ending` switch so you can force LF/CRLF/CR output when seeding cross-platform fixtures. Alongside it, heredoc-style flags (`--with-here TAG`, `--body-here TAG`) let you paste multi-line text directly into Safeedit, ending with the sentinel line instead of wrestling with shell escaping.
 
 ### CLI Semantics
 - **Common flags**

@@ -60,6 +60,35 @@ pub enum PagerMode {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum LineEndingChoice {
+    #[default]
+    Auto,
+    Lf,
+    Crlf,
+    Cr,
+}
+
+impl LineEndingChoice {
+    fn resolve(self, existing: Option<LineEndingStyle>) -> LineEndingStyle {
+        match self {
+            LineEndingChoice::Auto => existing.unwrap_or(system_default_line_ending()),
+            LineEndingChoice::Lf => LineEndingStyle::Lf,
+            LineEndingChoice::Crlf => LineEndingStyle::Crlf,
+            LineEndingChoice::Cr => LineEndingStyle::Cr,
+        }
+    }
+}
+
+fn system_default_line_ending() -> LineEndingStyle {
+    if cfg!(windows) {
+        LineEndingStyle::Crlf
+    } else {
+        LineEndingStyle::Lf
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     run(cli)
@@ -78,6 +107,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Log(cmd) => handle_log(cmd)?,
         Command::Report(cmd) => handle_report(cmd)?,
         Command::Cleanup(cmd) => handle_cleanup(cmd)?,
+        Command::Write(cmd) => handle_write(cmd)?,
     }
 
     Ok(())
@@ -984,28 +1014,54 @@ fn resolve_replacement_text(cmd: &ReplaceCommand) -> Result<(String, &'static st
         let text = read_replacement_from_clipboard()?;
         return Ok((text, "clipboard"));
     }
-    bail!("replacement text required; use --with, --with-stdin, or --with-clipboard");
+    if let Some(tag) = &cmd.with_here {
+        let text = read_heredoc_input(tag, "replacement")?;
+        return Ok((text, "heredoc"));
+    }
+    bail!("replacement text required; use --with, --with-stdin, --with-clipboard, or --with-here");
 }
 
-fn resolve_block_body(cmd: &BlockCommand) -> Result<(String, &'static str)> {
-    if !cmd.body.is_empty() {
-        let text = cmd.body.join("\n");
+fn resolve_body_from_sources(
+    literal_lines: &[String],
+    body_file: &Option<PathBuf>,
+    with_stdin: bool,
+    with_clipboard: bool,
+    heredoc_tag: &Option<String>,
+    description: &str,
+) -> Result<(String, &'static str)> {
+    if !literal_lines.is_empty() {
+        let text = literal_lines.join("\n");
         return Ok((text, "literal"));
     }
-    if let Some(path) = &cmd.body_file {
+    if let Some(path) = body_file {
         let text = fs::read_to_string(path)
-            .with_context(|| format!("reading block body from {}", path.display()))?;
+            .with_context(|| format!("reading {description} from {}", path.display()))?;
         return Ok((text, "file"));
     }
-    if cmd.with_stdin {
+    if let Some(tag) = heredoc_tag {
+        let text = read_heredoc_input(tag, description)?;
+        return Ok((text, "heredoc"));
+    }
+    if with_stdin {
         let text = read_replacement_from_stdin()?;
         return Ok((text, "stdin"));
     }
-    if cmd.with_clipboard {
+    if with_clipboard {
         let text = read_replacement_from_clipboard()?;
         return Ok((text, "clipboard"));
     }
-    bail!("block body required; use --body, --body-file, --with-stdin, or --with-clipboard");
+    bail!("{description} required; use --body, --body-file, --with-stdin, or --with-clipboard");
+}
+
+fn resolve_block_body(cmd: &BlockCommand) -> Result<(String, &'static str)> {
+    resolve_body_from_sources(
+        &cmd.body,
+        &cmd.body_file,
+        cmd.with_stdin,
+        cmd.with_clipboard,
+        &cmd.body_here,
+        "block body",
+    )
 }
 
 fn read_replacement_from_stdin() -> Result<String> {
@@ -1021,6 +1077,30 @@ fn read_replacement_from_clipboard() -> Result<String> {
     clipboard
         .get_text()
         .context("reading clipboard text for replacement")
+}
+
+fn read_heredoc_input(tag: &str, description: &str) -> Result<String> {
+    if tag.trim().is_empty() {
+        bail!("heredoc terminator cannot be empty");
+    }
+    println!("Enter {description}; finish with a line containing only {tag}.");
+    let mut buf = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = io::stdin()
+            .read_line(&mut line)
+            .context("reading heredoc input")?;
+        if bytes == 0 {
+            bail!("stdin closed before heredoc terminator '{tag}'");
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == tag {
+            break;
+        }
+        buf.push_str(&line);
+    }
+    Ok(buf)
 }
 
 fn handle_block(cmd: BlockCommand) -> Result<()> {
@@ -1153,6 +1233,165 @@ fn handle_block(cmd: BlockCommand) -> Result<()> {
         }
     }
     stats.print("block");
+    Ok(())
+}
+
+fn handle_write(cmd: WriteCommand) -> Result<()> {
+    let colorize = cmd.common.color.should_color();
+    let diff_config = cmd.common.diff_display_config(colorize);
+    let encoding = resolve_encoding_strategy(&cmd.common)?;
+    let (body_text, body_source) = resolve_body_from_sources(
+        &cmd.body,
+        &cmd.body_file,
+        cmd.with_stdin,
+        cmd.with_clipboard,
+        &cmd.body_here,
+        "write body",
+    )?;
+    let path = cmd.path.clone();
+    let exists = path.exists();
+    if exists && !cmd.allow_overwrite {
+        bail!(
+            "{} already exists; use --allow-overwrite to replace it",
+            path.display()
+        );
+    }
+
+    let mut entry = FileEntry {
+        path: path.clone(),
+        metadata: FileMetadata {
+            len: 0,
+            is_probably_binary: false,
+        },
+    };
+    let existing_decoded = if exists {
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        entry.metadata.len = bytes.len() as u64;
+        Some(encoding.decode(&bytes))
+    } else {
+        None
+    };
+    let target_line_style = cmd.line_ending.resolve(
+        existing_decoded
+            .as_ref()
+            .map(|d| detect_line_ending_style(&d.text)),
+    );
+    let normalized = normalize_to_lf(&body_text);
+    let new_text = restore_from_lf(normalized.into_owned(), target_line_style);
+    let old_text = existing_decoded
+        .as_ref()
+        .map(|d| d.text.clone())
+        .unwrap_or_default();
+
+    let patch_kind = if exists {
+        PatchKind::Modify
+    } else {
+        PatchKind::Create
+    };
+    let mut stats = CommandStats::default();
+    let details = vec![
+        format!("body_source={body_source}"),
+        format!("body_length={} chars", new_text.chars().count()),
+        format!("line_ending={:?}", cmd.line_ending),
+    ];
+    print_command_summary("write", &cmd.common, &encoding, &[entry.clone()], &details);
+
+    if old_text == new_text {
+        println!("content already matches {}; nothing to do.", path.display());
+        let summary = diff::summarize_lines(&old_text, &new_text);
+        let spans = diff::collect_line_spans(&old_text, &new_text);
+        log_change(
+            &cmd.common,
+            "write",
+            &path,
+            "no-op",
+            &summary,
+            &spans,
+            Some(status_with_patch(false, false, patch_kind)),
+        );
+        stats.no_op += 1;
+        stats.print("write");
+        return Ok(());
+    }
+
+    diff::display_diff(&old_text, &new_text, &diff_config)?;
+    let line_summary = diff::summarize_lines(&old_text, &new_text);
+    let line_spans = diff::collect_line_spans(&old_text, &new_text);
+
+    if !cmd.common.apply {
+        println!("dry-run: rerun with --apply to write this file.");
+        log_change(
+            &cmd.common,
+            "write",
+            &path,
+            "dry-run",
+            &line_summary,
+            &line_spans,
+            Some(status_with_patch(false, true, patch_kind)),
+        );
+        stats.dry_run += 1;
+        stats.print("write");
+        return Ok(());
+    }
+
+    let decision = if cmd.common.auto_apply {
+        ApprovalDecision::Apply
+    } else {
+        prompt_approval(&path)?
+    };
+
+    match decision {
+        ApprovalDecision::Apply | ApprovalDecision::ApplyAll => {
+            let decoded = existing_decoded.unwrap_or_else(|| {
+                let decision = encoding.decide(b"");
+                DecodedText {
+                    text: String::new(),
+                    had_errors: false,
+                    decision,
+                }
+            });
+            let result = TransformResult {
+                decoded,
+                new_text: new_text.clone(),
+            };
+            apply_transform(
+                &entry,
+                &result,
+                Some(result.decoded.decision.encoding),
+                cmd.common.undo_log.as_deref(),
+                cmd.common.no_backup,
+            )?;
+            stats.applied += 1;
+            log_change(
+                &cmd.common,
+                "write",
+                &path,
+                "applied",
+                &line_summary,
+                &line_spans,
+                Some(status_with_patch(true, false, patch_kind)),
+            );
+        }
+        ApprovalDecision::Skip => {
+            println!("skipped {}", path.display());
+            stats.skipped += 1;
+            log_change(
+                &cmd.common,
+                "write",
+                &path,
+                "skipped",
+                &line_summary,
+                &line_spans,
+                Some(status_with_patch(false, false, patch_kind)),
+            );
+        }
+        ApprovalDecision::Quit => {
+            println!("stopping after user request.");
+            stats.skipped += 1;
+        }
+    }
+
+    stats.print("write");
     Ok(())
 }
 
@@ -2410,6 +2649,7 @@ fn build_replace_command(
         replacement: step.replacement.clone(),
         with_stdin: step.with_stdin,
         with_clipboard: step.with_clipboard,
+        with_here: None,
         regex: step.regex,
         literal: step.literal,
         diff_only: step.diff_only,
@@ -2462,6 +2702,7 @@ enum Command {
     Log(LogCommand),
     Report(ReportCommand),
     Cleanup(CleanupCommand),
+    Write(WriteCommand),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2521,13 +2762,15 @@ struct ReplaceCommand {
         long = "with",
         value_name = "TEXT",
         conflicts_with_all = ["with_stdin", "with_clipboard"],
-        required_unless_present_any = ["with_stdin", "with_clipboard"]
+        required_unless_present_any = ["with_stdin", "with_clipboard", "with_here"]
     )]
     replacement: Option<String>,
     #[arg(long = "with-stdin", action = ArgAction::SetTrue, conflicts_with = "with_clipboard")]
     with_stdin: bool,
     #[arg(long = "with-clipboard", action = ArgAction::SetTrue, conflicts_with = "with_stdin")]
     with_clipboard: bool,
+    #[arg(long = "with-here", value_name = "TAG", conflicts_with_all = ["replacement", "with_stdin", "with_clipboard"])]
+    with_here: Option<String>,
     #[arg(long, action = ArgAction::SetTrue)]
     regex: bool,
     #[arg(long, action = ArgAction::SetTrue)]
@@ -2572,21 +2815,23 @@ struct BlockCommand {
         long = "body",
         value_name = "TEXT",
         action = ArgAction::Append,
-        conflicts_with_all = ["body_file", "with_stdin", "with_clipboard"],
-        required_unless_present_any = ["body_file", "with_stdin", "with_clipboard"]
+        conflicts_with_all = ["body_file", "with_stdin", "with_clipboard", "body_here"],
+        required_unless_present_any = ["body_file", "with_stdin", "with_clipboard", "body_here"]
     )]
     body: Vec<String>,
     #[arg(
         long = "body-file",
         value_name = "FILE",
         value_hint = ValueHint::FilePath,
-        conflicts_with_all = ["body", "with_stdin", "with_clipboard"]
+        conflicts_with_all = ["body", "with_stdin", "with_clipboard", "body_here"]
     )]
     body_file: Option<PathBuf>,
-    #[arg(long = "with-stdin", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_clipboard"])]
+    #[arg(long = "with-stdin", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_clipboard", "body_here"])]
     with_stdin: bool,
-    #[arg(long = "with-clipboard", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_stdin"])]
+    #[arg(long = "with-clipboard", action = ArgAction::SetTrue, conflicts_with_all = ["body", "body_file", "with_stdin", "body_here"])]
     with_clipboard: bool,
+    #[arg(long = "body-here", value_name = "TAG", conflicts_with_all = ["body", "body_file", "with_stdin", "with_clipboard"])]
+    body_here: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2605,6 +2850,51 @@ impl std::str::FromStr for BlockMode {
             _ => Err("expected 'insert' or 'replace'"),
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct WriteCommand {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long = "path", value_name = "FILE", value_hint = ValueHint::FilePath)]
+    path: PathBuf,
+    #[arg(
+        long = "body",
+        value_name = "TEXT",
+        action = ArgAction::Append,
+        conflicts_with_all = ["body_file", "with_stdin", "with_clipboard", "body_here"],
+        required_unless_present_any = ["body_file", "with_stdin", "with_clipboard", "body_here"]
+    )]
+    body: Vec<String>,
+    #[arg(
+        long = "body-file",
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath,
+        conflicts_with_all = ["body", "with_stdin", "with_clipboard", "body_here"]
+    )]
+    body_file: Option<PathBuf>,
+    #[arg(
+        long = "with-stdin",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["body", "body_file", "with_clipboard", "body_here"]
+    )]
+    with_stdin: bool,
+    #[arg(
+        long = "with-clipboard",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["body", "body_file", "with_stdin", "body_here"]
+    )]
+    with_clipboard: bool,
+    #[arg(
+        long = "body-here",
+        value_name = "TAG",
+        conflicts_with_all = ["body", "body_file", "with_stdin", "with_clipboard"]
+    )]
+    body_here: Option<String>,
+    #[arg(long = "allow-overwrite", action = ArgAction::SetTrue)]
+    allow_overwrite: bool,
+    #[arg(long = "line-ending", value_enum, default_value = "auto")]
+    line_ending: LineEndingChoice,
 }
 
 #[derive(Debug, Args)]
@@ -2705,7 +2995,7 @@ struct ReportCommand {
 
 #[cfg(test)]
 mod patch_line_ending_tests {
-    use super::{DiffPatch, apply_patch_preserving_newlines};
+    use super::{DiffPatch, LineEndingChoice, LineEndingStyle, apply_patch_preserving_newlines};
 
     #[test]
     fn apply_patch_respects_crlf_inputs() {
@@ -2722,6 +3012,39 @@ mod patch_line_ending_tests {
         let patched =
             apply_patch_preserving_newlines(original, &patch).expect("patch applies cleanly");
         assert_eq!(patched, "alpha\r\nbeta2\r\n");
+    }
+    #[test]
+    fn line_ending_choice_prefers_existing_style() {
+        assert_eq!(
+            LineEndingChoice::Auto.resolve(Some(LineEndingStyle::Cr)),
+            LineEndingStyle::Cr
+        );
+    }
+
+    #[test]
+    fn line_ending_choice_specific_variants() {
+        assert_eq!(
+            LineEndingChoice::Lf.resolve(Some(LineEndingStyle::Crlf)),
+            LineEndingStyle::Lf
+        );
+        assert_eq!(
+            LineEndingChoice::Crlf.resolve(Some(LineEndingStyle::Lf)),
+            LineEndingStyle::Crlf
+        );
+        assert_eq!(
+            LineEndingChoice::Cr.resolve(Some(LineEndingStyle::Lf)),
+            LineEndingStyle::Cr
+        );
+    }
+
+    #[test]
+    fn line_ending_choice_auto_uses_platform_default() {
+        let expected = if cfg!(windows) {
+            LineEndingStyle::Crlf
+        } else {
+            LineEndingStyle::Lf
+        };
+        assert_eq!(LineEndingChoice::Auto.resolve(None), expected);
     }
 }
 

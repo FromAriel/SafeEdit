@@ -1,0 +1,2 @@
+println!("heredoc line 1");
+println!("heredoc line 2");
