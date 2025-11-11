@@ -27,7 +27,7 @@ Deliver a Windows-friendly Rust CLI that performs complex text/code edits while 
 | --- | --- | --- |
 | `replace` | Replace a literal or regex match with supplied text. | `--regex`, `--literal`, `--count=N`, `--after-line`, `--encoding`, `--preview-context`, `--diff-only`, `--with-stdin`, `--with-clipboard`, `--with-here TAG` |
 | `apply` | Replay unified `.patch`/`.diff` files (mods + file create/delete) through the preview + approval loop. | `--patch <file>` (repeatable), `--root <dir>`, plus global `--apply/--yes/--context/--color` |
-| `block` | Insert/replace multi-line blocks anchored by sentinels or single-line anchors (`--insert-after/--insert-before`) with optional `--expect-blocks` guards; `--mode after/before` aliases map to `insert` for intuitive CLI usage. | `--start-marker`, `--end-marker`, `--insert-after`, `--insert-before`, `--mode={insert,replace}`, `--body*/--body-file/--with-stdin/--with-clipboard/--body-here`, `--expect-blocks` |
+| `block` | Insert/replace multi-line blocks anchored by sentinels or single-line anchors (`--insert-after/--insert-before`) with optional `--expect-blocks` guards and marker-overlap protection; `--mode after/before` aliases map to `insert`. | `--start-marker`, `--end-marker`, `--insert-after`, `--insert-before`, `--mode={insert,replace}`, `--body*/--body-file/--with-stdin/--with-clipboard/--body-here`, `--expect-blocks`, `--allow-marker-overlap` |
 | `write` | Create or overwrite files (great for staging snippets) using the same diff/backups/undo pipeline. | `--path <file>`, `--body/--body-file/--with-stdin/--with-clipboard/--body-here TAG`, `--allow-overwrite`, `--line-ending {auto,lf,crlf,cr}` |
 | `rename` | Rename identifiers/constants across files (case-preserving). | `--word-boundary`, `--case-aware`, `--target/--glob` |
 | `review` | Inspect files safely via head/tail, arbitrary line ranges, or interactive stepping. | `--head N`, `--tail N`, `--lines 120-160`, `--search`, `--highlight` |
@@ -102,6 +102,7 @@ The `review` command shares the preview loop but never writes; it simply paginat
   `No exact match for "FooBar"; closest occurrences:` with line numbers/diff.
 - **Match guards:** `--expect <n>` fails if match count differs; `--max <n>` prevents runaway replacements.
 - **Block anchoring helpers:** `--insert-after/--insert-before` provide single-line anchors, previews now report the matched line span, and `--expect-blocks` enforces deterministic counts before prompting.
+- **Marker overlap detection:** SafeEdit now inspects the adjusted block body and refuses to apply if it still contains the provided start/end markers—preventing the duplicate inserts we saw when headings repeated. Power users can bypass with `--allow-marker-overlap`, but the default keeps block replacements idempotent.
 - **Encoding handling:** Auto-detect via `chardetng` or BOM; manual override; diff output always UTF-8 to avoid mojibake.
 - **UNDO artifacts:** Save `*.undo.patch` (git-style) plus manifest referencing original files & checksums.
 - **Backups:** Optional `.bak` or timestamped copies; default on for non-git repos, configurable via `~/.safeedit.toml`.
@@ -219,6 +220,8 @@ Enable `RUST_LOG=safeedit=debug` when we add logging, and consider `cargo nextes
 - Language server hints for symbol renames.
 - Pluggable diff viewers (e.g., HTML export).
 - VS Code/Editor integration that shells out to `safeedit`.
+
+## Follow-Up Issues (Nov 2025 Review)
 
 ## Follow-Up Issues (Nov 2025 Review)
 - **Batch runner verb expansion (optional)** (`safeedit/src/batch.rs:10-120`): block + rename are now wired; consider adding `apply` (patch replay) or `review` steps if we need end-to-end refactors in a single plan, otherwise keep the current surface area documented.

@@ -1126,12 +1126,16 @@ fn handle_block(cmd: BlockCommand) -> Result<()> {
     if let Some(expect) = expect_blocks {
         details.push(format!("expect_blocks={expect}"));
     }
+    if cmd.allow_marker_overlap {
+        details.push("allow_marker_overlap=true".into());
+    }
     print_command_summary("block", &cmd.common, &encoding, &entries, &details);
     let options = BlockOptions {
         target,
         mode,
         body: body_text,
         expect: expect_blocks,
+        allow_marker_overlap: cmd.allow_marker_overlap,
     };
     let apply_mode = cmd.common.apply;
     let mut apply_all = cmd.common.auto_apply && apply_mode;
@@ -2732,6 +2736,7 @@ fn build_block_command(base_common: &CommonArgs, step: &batch::BlockPlan) -> Res
         with_clipboard: false,
         body_here: None,
         expect_blocks: step.expect_blocks,
+        allow_marker_overlap: step.allow_marker_overlap.unwrap_or(false),
     })
 }
 
@@ -2931,6 +2936,8 @@ struct BlockCommand {
     body_here: Option<String>,
     #[arg(long = "expect-blocks", value_name = "N")]
     expect_blocks: Option<usize>,
+    #[arg(long = "allow-marker-overlap", action = ArgAction::SetTrue)]
+    allow_marker_overlap: bool,
 }
 
 impl BlockCommand {

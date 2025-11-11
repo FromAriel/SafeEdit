@@ -116,6 +116,8 @@ pub struct BlockPlan {
     pub insert_before: Option<String>,
     pub mode: Option<String>,
     pub expect_blocks: Option<usize>,
+    #[serde(default)]
+    pub allow_marker_overlap: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

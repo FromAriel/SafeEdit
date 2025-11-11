@@ -47,6 +47,7 @@ pub struct BlockOptions {
     pub mode: BlockMode,
     pub body: String,
     pub expect: Option<usize>,
+    pub allow_marker_overlap: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +170,22 @@ fn apply_block(decoded: &DecodedText, options: &BlockOptions) -> Result<Option<S
 
     let indent = block_indent(text, location.indent_anchor);
     let desired = adjust_block_body(existing, &options.body, text, &indent);
+    if !options.allow_marker_overlap {
+        if let BlockTarget::Range { start, end } = &options.target {
+            if contains_marker(&desired, start) {
+                bail!(
+                    "block body still contains start marker \"{}\"; use --allow-marker-overlap or widen the sentinel",
+                    preview_marker(start)
+                );
+            }
+            if contains_marker(&desired, end) {
+                bail!(
+                    "block body still contains end marker \"{}\"; use --allow-marker-overlap or widen the sentinel",
+                    preview_marker(end)
+                );
+            }
+        }
+    }
 
     if existing == desired {
         return Ok(None);
@@ -344,6 +361,10 @@ fn preview_marker(marker: &str) -> String {
     } else {
         escaped
     }
+}
+
+fn contains_marker(body: &str, marker: &str) -> bool {
+    !marker.is_empty() && body.contains(marker)
 }
 
 fn adjust_block_body(existing: &str, requested: &str, full_text: &str, indent: &str) -> String {
@@ -861,6 +882,7 @@ mod tests {
             mode: BlockMode::Replace,
             body: "\nnew\n".into(),
             expect: None,
+            allow_marker_overlap: false,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -879,6 +901,7 @@ mod tests {
             mode: BlockMode::Replace,
             body: "updated line".into(),
             expect: None,
+            allow_marker_overlap: false,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -897,6 +920,7 @@ mod tests {
             mode: BlockMode::Replace,
             body: "new".into(),
             expect: None,
+            allow_marker_overlap: false,
         };
         let replaced = apply_block(&decoded, &options)
             .expect("block")
@@ -915,9 +939,46 @@ mod tests {
             mode: BlockMode::Insert,
             body: "\nnew\n".into(),
             expect: None,
+            allow_marker_overlap: false,
         };
         let err = apply_block(&decoded, &options).expect_err("should fail");
         assert!(format!("{err:#}").contains("insert mode"));
+    }
+
+    #[test]
+    fn block_rejects_body_with_start_marker() {
+        let decoded = decoded_text("// begin\nold\n// end\n");
+        let options = BlockOptions {
+            target: BlockTarget::Range {
+                start: "// begin".into(),
+                end: "// end".into(),
+            },
+            mode: BlockMode::Replace,
+            body: "// begin\nnew\n// end\n".into(),
+            expect: None,
+            allow_marker_overlap: false,
+        };
+        let err = apply_block(&decoded, &options).expect_err("should fail");
+        assert!(format!("{err:#}").contains("start marker"));
+    }
+
+    #[test]
+    fn block_allows_marker_overlap_when_opted_in() {
+        let decoded = decoded_text("// begin\nold\n// end\n");
+        let options = BlockOptions {
+            target: BlockTarget::Range {
+                start: "// begin".into(),
+                end: "// end".into(),
+            },
+            mode: BlockMode::Replace,
+            body: "// begin\nnew\n// end\n".into(),
+            expect: None,
+            allow_marker_overlap: true,
+        };
+        let replaced = apply_block(&decoded, &options)
+            .expect("block")
+            .expect("text");
+        assert!(replaced.contains("new"));
     }
 
     #[test]
@@ -930,6 +991,7 @@ mod tests {
             mode: BlockMode::Insert,
             body: "    inserted();\n".into(),
             expect: None,
+            allow_marker_overlap: false,
         };
         let updated = apply_block(&decoded, &options)
             .expect("block")
@@ -947,6 +1009,7 @@ mod tests {
             mode: BlockMode::Insert,
             body: "println!(\"hi\");\n".into(),
             expect: Some(1),
+            allow_marker_overlap: false,
         };
         let updated = apply_block(&decoded, &options)
             .expect("block")
@@ -965,6 +1028,7 @@ mod tests {
             mode: BlockMode::Replace,
             body: "keep".into(),
             expect: Some(2),
+            allow_marker_overlap: false,
         };
         let err = apply_block(&decoded, &options).expect_err("mismatch");
         assert!(format!("{err:#}").contains("expected 2 block"));

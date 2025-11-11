@@ -43,6 +43,7 @@ Use this checklist whenever you need to validate Safeedit end-to-end. Treat it a
 - [ ] Insert a block between `// BEGIN GENERATED` and `// END GENERATED`; confirm multi-line diff readability.
 - [ ] Use `--insert-after "fn main()"` (no end marker) to append instrumentation and ensure indentation matches the anchor line.
 - [ ] Use `--insert-before` to prepend content above an indented line; pair it with `--expect-blocks 1` to confirm deterministic guardrails.
+- [ ] Intentionally supply a body that still contains the start marker (e.g., copy the heading) and confirm SafeEdit aborts with the new overlap warning; rerun with `--allow-marker-overlap` to verify the override path.
 - [ ] Switch to `--mode replace` and ensure existing blocks are replaced, not duplicated.
 - [ ] Run without markers to verify the error includes nearby context hints.
 

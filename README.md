@@ -15,7 +15,7 @@ SafeEdit is a Windows-friendly Rust CLI for applying complex text/code edits whi
 | --- | --- | --- |
 | `replace` | Literal/regex replacements with diff previews and match guards; accepts literal, stdin, clipboard, or heredoc (`--with-here TAG`) inputs. | `safeedit replace --target src --literal --pattern "foo" --with-here END` + pasted text ending in `END` |
 | `rename` | Case-aware identifier renames with word-boundary controls. | `safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware` |
-| `block` | Insert/replace multi-line regions bounded by markers or single-line anchors via `--insert-after/--insert-before`, with heredoc (`--body-here`) inputs and `--expect-blocks` guards. (`--mode after/before` act as aliases for `insert`.) | `safeedit block --target file.rs --insert-after "fn main()" --body-here BODY` |
+| `block` | Insert/replace multi-line regions bounded by markers or single-line anchors via `--insert-after/--insert-before`, with heredoc (`--body-here`) inputs, marker-overlap detection (`--allow-marker-overlap` to override), and `--expect-blocks` guards. (`--mode after/before` act as aliases for `insert`.) | `safeedit block --target file.rs --insert-after "fn main()" --body-here BODY` |
 | `write` | Create or overwrite files with diff previews, backups, and explicit line-ending controls—perfect for staging snippets. | `safeedit write --path snippets/helper.rs --body-here SNIP --line-ending crlf --apply` |
 | `apply` | Replay unified `.patch`/`.diff` files (modify/create/delete/rename) through the preview/approval pipeline while preserving original newline styles. | `safeedit apply --patch changes.diff --apply` |
 | `review` | Safe file viewing: `--head`, `--tail`, `--lines`, `--search`, `--step`, or long-running `--follow`. Built-in pager kicks in past ~200 diff lines. | `safeedit review --target app/main.rs --head 20 --search todo` |
@@ -68,6 +68,7 @@ println!("loggable step");
 BODY
 
 > PowerShell tip: wrap markers/start/end strings in single quotes (e.g., `'// BEGIN GENERATED'`) so embedded double quotes or parentheses aren't eaten by the shell.
+> Block tip: if the replacement body still contains your start/end markers (e.g., identical headings), SafeEdit now aborts to prevent duplicate inserts. Adjust the sentinel (heading + next heading) or pass `--allow-marker-overlap` only when you truly need the markers to remain in the body.
 
 # Rename identifiers across the project, preserving case
 safeedit rename --target app --from VERSION --to APP_VERSION --word-boundary --case-aware --apply
